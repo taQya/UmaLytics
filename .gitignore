@@ -1,2 +1,4 @@
 horselist/
 __pycache__/
+build/
+dist/

@@ -243,8 +243,52 @@ def load_payback(path: Path):
         fuku = [to_int(g(r, f"複勝組番{i}")) for i in (1, 2, 3)]
         fuku = [u for u in fuku if u > 0]
         if place and race_no > 0 and win_uma > 0:
+            # 着順マップ: 1着=単勝組番。2着は馬単組番2、3着は三連単組番3
+            # (JRA結果形式の2着馬番/3着馬番列にも対応)。特定できない馬のみ
+            # 複勝組番から「3着内」として扱う。
+            chaku = {win_uma: "1着"}
+            u2 = to_int(g(r, "2着馬番", "馬単組番2"))
+            u3 = to_int(g(r, "3着馬番", "３連単組番馬番3", "3連単組番馬番3"))
+            if u2 > 0:
+                chaku[u2] = "2着"
+            if u3 > 0 and u3 not in chaku:
+                chaku[u3] = "3着"
+            # 三連単が無い場合: 複勝組番のうち1・2着以外の残り1頭を3着と確定
+            rest = [u for u in fuku if u not in chaku]
+            if len(rest) == 1 and "3着" not in chaku.values():
+                chaku[rest[0]] = "3着"
+            for u in fuku:
+                chaku.setdefault(u, "3着内")
+
+            # --- 組合せ馬券の実払戻(的中判定用) ---
+            combos = {}
+            uq1, uq2 = to_int(g(r, "馬複組番1")), to_int(g(r, "馬複組番2"))
+            if uq1 and uq2:
+                combos["馬複"] = (frozenset({uq1, uq2}),
+                                  to_int(g(r, "馬複払戻金（円）", "馬複払戻金(円)")))
+            ex1, ex2 = to_int(g(r, "馬単組番1")), to_int(g(r, "馬単組番2"))
+            if ex1 and ex2:
+                combos["馬単"] = ((ex1, ex2),
+                                  to_int(g(r, "馬単払戻金（円）", "馬単払戻金(円)")))
+            wides = []
+            for i in (1, 2, 3):
+                w1 = to_int(g(r, f"ワイド組番{i}馬番1"))
+                w2 = to_int(g(r, f"ワイド組番{i}馬番2"))
+                wp = to_int(g(r, f"ワイド払戻金{i}（円）", f"ワイド払戻金{i}(円)"))
+                if w1 and w2:
+                    wides.append((frozenset({w1, w2}), wp))
+            if wides:
+                combos["ワイド"] = wides
+            t1 = to_int(g(r, "３連複組番馬番1", "3連複組番馬番1"))
+            t2 = to_int(g(r, "３連複組番馬番2", "3連複組番馬番2"))
+            t3 = to_int(g(r, "３連複組番馬番3", "3連複組番馬番3"))
+            if t1 and t2 and t3:
+                combos["三連複"] = (frozenset({t1, t2, t3}),
+                                    to_int(g(r, "３連複払戻金（円）", "3連複払戻金(円)")))
+
             result[(place, race_no)] = {
                 "勝ち馬番": win_uma, "単勝払戻": pay, "複勝馬番": fuku,
+                "着順マップ": chaku, "組合せ払戻": combos,
             }
     return result
 
@@ -256,9 +300,25 @@ def find_sibling(horselist_path: Path, keyword: str):
       - 地方競馬: YYYYMMDD_horselist.csv → YYYYMMDD_payback.csv
       - 中央競馬: JRA_YYYY_MMDD_horselist.csv → JRA_YYYY_MMDD_payback.csv
     """
-    cand = Path(str(horselist_path).replace("horselist", keyword))
-    if cand != horselist_path and cand.exists():
-        return cand
+    hp = Path(horselist_path)
+    # ファイル名部分だけを置換する(親ディレクトリ名に 'horselist' が
+    # 含まれていても影響を受けないようにする)。
+    if "horselist" in hp.name:
+        cand = hp.with_name(hp.name.replace("horselist", keyword))
+        if cand != hp and cand.exists():
+            return cand
+    # フォールバック: 同じディレクトリ内で keyword を含むCSVを探す。
+    # 日付プレフィックスが一致するものを優先する。
+    import re
+    m = re.search(r"(20\d{2}[_-]?\d{2}[_-]?\d{2})", hp.name)
+    ymd = re.sub(r"[_-]", "", m.group(1)) if m else None
+    cands = sorted(hp.parent.glob(f"*{keyword}*.csv"))
+    if ymd:
+        for c in cands:
+            if ymd in re.sub(r"[_-]", "", c.name):
+                return c
+    if len(cands) == 1:
+        return cands[0]
     return None
 
 def detect_ymd_from_name(path, fallback=None):
@@ -283,6 +343,55 @@ def detect_ymd_from_name(path, fallback=None):
 
 
 # ============================================================
+# 予想スナップショット(確定)
+# ============================================================
+# 人気・オッズは締切まで変動するため、データを取得し直すたびに予想が
+# 変わってしまう問題への対策。最初に予想した時点のスコアをJSONに保存し、
+# 同じ開催日の再実行ではそのスコアを使って印・順位を固定する。
+# ※期待値買いは「確定した勝率 × 最新オッズ」で毎回再計算される(意図的)。
+
+def snapshot_file(horselist_path):
+    """horselistと同じディレクトリの確定ファイルパスを返す"""
+    hp = Path(horselist_path)
+    ymd = detect_ymd_from_name(hp, None) or "today"
+    return hp.parent / f"yosou_fixed_{ymd}.json"
+
+
+def load_snapshot(horselist_path):
+    f = snapshot_file(horselist_path)
+    if not f.exists():
+        return None
+    try:
+        import json as _json
+        return _json.loads(f.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def save_snapshot(horselist_path, races_scores):
+    """races_scores: {"場|R": {"scores": {"馬番": score}}} を保存"""
+    import json as _json
+    from datetime import datetime as _dt
+    f = snapshot_file(horselist_path)
+    data = {"確定時刻": _dt.now().strftime("%Y-%m-%d %H:%M"),
+            "races": races_scores}
+    f.write_text(_json.dumps(data, ensure_ascii=False, indent=1),
+                 encoding="utf-8")
+    return f
+
+
+def apply_snapshot(ranked, snap_scores):
+    """確定済みスコアを適用して並べ直す。
+    確定後に出走取消となった馬は自然に除外され、確定時に居なかった馬
+    (出走変更など)は計算済みスコアのまま末尾側に並ぶ。"""
+    for h in ranked:
+        s = snap_scores.get(str(h.umaban))
+        if s is not None:
+            h.score = float(s)
+    return sorted(ranked, key=lambda x: x.score, reverse=True)
+
+
+# ============================================================
 # スコアリング(レース前情報のみ使用)
 # ============================================================
 
@@ -297,7 +406,7 @@ PARAMS = {
     "recent": 0.6,       # 近走成績のスケール
     "apt": 1.0,          # 適性(当場/当距離/馬場)のスケール
     "jockey": 1.0,       # 騎手評価のスケール
-    "ninki": 1.0,        # 人気点のスケール
+    "ninki": 1.0,        # 人気点のスケール(0で人気を参考にしない)
     "kinryo": 200.0,     # 斤量(平均比)の係数
     "softmax_t": 10.0,   # スコア→勝率の温度
     "jra_affili": 8.0,   # JRA所属馬への加点(交流重賞での実力差を考慮)
@@ -441,19 +550,21 @@ def score_horse(h: Horse, info=None):
         reasons.append("減量騎手の恩恵あり")
 
     # --- 人気(市場評価) ---
+    # PARAMS["ninki"] が 0 のときは人気を一切参考にしない(加減点も根拠タグも無し)
     npt = PARAMS["ninki"]
-    if h.ninki == 1:
-        score += 12 * npt; reasons.append("1番人気の支持")
-    elif h.ninki == 2:
-        score += 8 * npt
-    elif h.ninki == 3:
-        score += 5 * npt
-    elif 4 <= h.ninki <= 6:
-        score += 1 * npt
-    elif 7 <= h.ninki <= 9:
-        score -= 4 * npt
-    elif h.ninki >= 10:
-        score -= 8 * npt
+    if npt != 0:
+        if h.ninki == 1:
+            score += 12 * npt; reasons.append("1番人気の支持")
+        elif h.ninki == 2:
+            score += 8 * npt
+        elif h.ninki == 3:
+            score += 5 * npt
+        elif 4 <= h.ninki <= 6:
+            score += 1 * npt
+        elif 7 <= h.ninki <= 9:
+            score -= 4 * npt
+        elif h.ninki >= 10:
+            score -= 8 * npt
 
     # --- 馬体重の増減(体重比で判定: ばんえい馬対応) ---
     if h.weight > 0 and h.weight_diff != 0:
@@ -555,6 +666,118 @@ def ev_bets(ranked, threshold=100.0, payout=TAKEOUT_RETURN):
     return picks[:EV_MAX_BETS]
 
 # ============================================================
+# 印からの組合せ馬券 期待値計算(馬単・馬複・ワイド・三連複)
+# ============================================================
+# モデル勝率(model_probs)と市場勝率(オッズ/人気由来)からHarville法で
+# 各組合せの的中確率を求め、推定配当(払戻率/市場確率)と掛けて期待値を出す。
+# 単勝の期待値買いと同じ「モデルと市場の見解が割れた組合せ」を拾う考え方。
+
+COMBO_PAYOUT = {  # 券種別の払戻率(概算)
+    True:  {"馬複": 0.775, "馬単": 0.75, "ワイド": 0.775, "三連複": 0.75},   # 中央
+    False: {"馬複": 0.75,  "馬単": 0.75, "ワイド": 0.75,  "三連複": 0.725},  # 地方
+}
+
+
+def _market_prob_map(ranked, payout):
+    """市場の勝率マップ {馬番: p}。実オッズがあれば1/オッズ比例、無ければ人気Zipf"""
+    om = estimate_odds_map(ranked, payout)
+    raw = {u: 1.0 / o for u, (o, _real) in om.items()}
+    s = sum(raw.values())
+    return {u: v / s for u, v in raw.items()}
+
+
+def _harville_pair(p, a, b):
+    """a→b(馬単)の確率"""
+    return p[a] * p[b] / max(1e-9, 1 - p[a])
+
+
+def _harville_top3(p_map):
+    """全馬の順序付き3着以内を列挙し、
+    (三連複setの確率dict, ワイドpairの確率dict) を返す"""
+    from itertools import permutations
+    umas = list(p_map)
+    trio = {}
+    wide = {}
+    for a, b, c in permutations(umas, 3):
+        pa, pb, pc = p_map[a], p_map[b], p_map[c]
+        pr = pa * pb / max(1e-9, 1 - pa) * pc / max(1e-9, 1 - pa - pb)
+        key3 = frozenset({a, b, c})
+        trio[key3] = trio.get(key3, 0.0) + pr
+    for key3, pr in trio.items():
+        for pair in ({x, y} for x in key3 for y in key3 if x < y):
+            fk = frozenset(pair)
+            wide[fk] = wide.get(fk, 0.0) + pr
+    return trio, wide
+
+
+def ev_combo_bets(ranked, threshold=100.0, jra=False, top_n=4, per_type=2):
+    """印上位top_n頭の組合せから、期待値がしきい値以上の買い目を返す。
+    戻り値: [{"券種","組","確率","推定配当","ev"}...](期待値降順)"""
+    if len(ranked) < 3:
+        return []
+    payout_win = TAKEOUT_RETURN_JRA if jra else TAKEOUT_RETURN
+    pm = dict(zip((h.umaban for h in ranked), model_probs(ranked)))
+    pk = _market_prob_map(ranked, payout_win)
+    rates = COMBO_PAYOUT[bool(jra)]
+    tops = [h.umaban for h in ranked[:top_n]]
+
+    m_trio, m_wide = _harville_top3(pm)
+    k_trio, k_wide = _harville_top3(pk)
+
+    from itertools import combinations, permutations
+    cands = []
+
+    def add(kind, key, disp, p_model, p_mkt):
+        if p_model <= 0 or p_mkt <= 0:
+            return
+        est = rates[kind] / p_mkt
+        ev = p_model * est * 100
+        if ev >= threshold:
+            cands.append({"券種": kind, "組": key, "表示": disp,
+                          "確率": p_model, "推定配当": est, "ev": ev})
+
+    for a, b in combinations(tops, 2):
+        add("馬複", frozenset({a, b}), f"{a}-{b}",
+            _harville_pair(pm, a, b) + _harville_pair(pm, b, a),
+            _harville_pair(pk, a, b) + _harville_pair(pk, b, a))
+        add("ワイド", frozenset({a, b}), f"{a}-{b}",
+            m_wide.get(frozenset({a, b}), 0), k_wide.get(frozenset({a, b}), 0))
+    for a, b in permutations(tops, 2):
+        add("馬単", (a, b), f"{a}→{b}",
+            _harville_pair(pm, a, b), _harville_pair(pk, a, b))
+    for combo in combinations(tops, 3):
+        key = frozenset(combo)
+        disp = "-".join(str(x) for x in sorted(combo))
+        add("三連複", key, disp, m_trio.get(key, 0), k_trio.get(key, 0))
+
+    # 券種ごとに上位per_typeに絞り、全体を期待値降順で返す
+    cands.sort(key=lambda x: -x["ev"])
+    out, count = [], {}
+    for c in cands:
+        k = c["券種"]
+        if count.get(k, 0) >= per_type:
+            continue
+        count[k] = count.get(k, 0) + 1
+        out.append(c)
+    return out
+
+
+def combo_hit(pick, payback):
+    """組合せ買い目の的中判定。的中なら実払戻金、外れなら0を返す(判定不能はNone)"""
+    combos = (payback or {}).get("組合せ払戻", {})
+    kind, key = pick["券種"], pick["組"]
+    if kind == "ワイド":
+        for fs, pay in combos.get("ワイド", []):
+            if fs == key:
+                return pay
+        return 0 if combos.get("ワイド") else None
+    entry = combos.get(kind)
+    if entry is None:
+        return None
+    return entry[1] if entry[0] == key else 0
+
+
+# ============================================================
 # 出力
 # ============================================================
 
@@ -574,7 +797,7 @@ def confidence_label(ranked):
     return "混戦・波乱注意", "C"
 
 
-def chat_print(place, race_no, ranked, race_info, payback, top_n, picks):
+def chat_print(place, race_no, ranked, race_info, payback, top_n, picks, combo_picks=None):
     top = ranked[0]
     conf_text, conf_rank = confidence_label(ranked)
 
@@ -625,6 +848,9 @@ def chat_print(place, race_no, ranked, race_info, payback, top_n, picks):
                   f"(推定勝率{pk['prob']:.0%}×{o_label}{pk['odds']:.1f}倍=期待値{pk['ev']:.0f}%)")
     else:
         print("💰 期待値買い: 見送り(期待値が閾値未満)")
+    for c in (combo_picks or []):
+        print(f"🎲 組合せ期待値買い: [{c['券種']}] {c['表示']} "
+              f"(的中確率{c['確率']:.1%}×推定{c['推定配当']:.1f}倍=期待値{c['ev']:.0f}%)")
     if conf_rank == "C":
         print("💬 このレースは混戦模様。手広く構えるのが吉かも!")
 
@@ -647,6 +873,45 @@ def chat_print(place, race_no, ranked, race_info, payback, top_n, picks):
             our_rank = next((i + 1 for i, h in enumerate(ranked) if h.umaban == win), None)
             rank_s = f"(予想{our_rank}位評価)" if our_rank else ""
             print(f"❌ 結果: 勝ったのは{win}番{win_name}{rank_s}。◎は外れ…次いくよ!")
+        # --- 印と結果の対照 ---
+        cm = payback.get("着順マップ", {})
+        pairs = []
+        for i, h in enumerate(ranked[:5]):
+            mk = MARKS[i] if i < len(MARKS) else ""
+            pairs.append(f"{mk}→{cm.get(h.umaban, '圏外')}")
+        in_ken = sum(1 for h in ranked[:3] if h.umaban in cm)
+        print(f"🏅 印別結果: {' ／ '.join(pairs)} (印上位3頭中{in_ken}頭が3着以内)")
+        # --- 期待値買いの結果・収支 ---
+        if picks:
+            lines, t_in, t_out = [], 0, 0
+            for pk in picks:
+                u = pk["horse"].umaban
+                t_out += 100
+                if u == win:
+                    t_in += payback["単勝払戻"]
+                    lines.append(f"単勝{u}番:的中🎯+{payback['単勝払戻'] - 100}円")
+                elif u in cm:
+                    lines.append(f"単勝{u}番:{cm[u]}(単勝外れ)")
+                else:
+                    lines.append(f"単勝{u}番:外れ")
+            net = t_in - t_out
+            print(f"💰 期待値買い結果: {' ／ '.join(lines)} → 収支{'+' if net >= 0 else ''}{net}円")
+        if combo_picks:
+            clines, c_in, c_out = [], 0, 0
+            for c in combo_picks:
+                hp = combo_hit(c, payback)
+                if hp is None:
+                    clines.append(f"[{c['券種']}]{c['表示']}:判定不能")
+                    continue
+                c_out += 100
+                if hp > 0:
+                    c_in += hp
+                    clines.append(f"[{c['券種']}]{c['表示']}:的中🎯+{hp - 100}円")
+                else:
+                    clines.append(f"[{c['券種']}]{c['表示']}:外れ")
+            if c_out:
+                cnet = c_in - c_out
+                print(f"🎲 組合せ買い結果: {' ／ '.join(clines)} → 収支{'+' if cnet >= 0 else ''}{cnet}円")
     return hit, fuku_hit
 
 
@@ -695,7 +960,9 @@ def run(horselist: Path, racelist, payback_path, place_filter, race_filter,
         pb = paybacks.get(key)
         payout = TAKEOUT_RETURN_JRA if jra else TAKEOUT_RETURN
         picks = ev_bets(ranked, ev_threshold, payout)
-        hit, fuku_hit = chat_print(key[0], key[1], ranked, race_info.get(key), pb, top_n, picks)
+        combo_picks = ev_combo_bets(ranked, ev_threshold, jra)
+        hit, fuku_hit = chat_print(key[0], key[1], ranked, race_info.get(key), pb,
+                                   top_n, picks, combo_picks)
         if pb:
             if not picks:
                 ev_skip += 1

@@ -234,8 +234,52 @@ def load_payback(path: Path):
         fuku = [to_int(g(r, f"複勝組番{i}")) for i in (1, 2, 3)]
         fuku = [u for u in fuku if u > 0]
         if place and race_no > 0 and win_uma > 0:
+            # 着順マップ: 1着=単勝組番。2着は馬単組番2、3着は三連単組番3
+            # (JRA結果形式の2着馬番/3着馬番列にも対応)。特定できない馬のみ
+            # 複勝組番から「3着内」として扱う。
+            chaku = {win_uma: "1着"}
+            u2 = to_int(g(r, "2着馬番", "馬単組番2"))
+            u3 = to_int(g(r, "3着馬番", "３連単組番馬番3", "3連単組番馬番3"))
+            if u2 > 0:
+                chaku[u2] = "2着"
+            if u3 > 0 and u3 not in chaku:
+                chaku[u3] = "3着"
+            # 三連単が無い場合: 複勝組番のうち1・2着以外の残り1頭を3着と確定
+            rest = [u for u in fuku if u not in chaku]
+            if len(rest) == 1 and "3着" not in chaku.values():
+                chaku[rest[0]] = "3着"
+            for u in fuku:
+                chaku.setdefault(u, "3着内")
+
+            # --- 組合せ馬券の実払戻(的中判定用) ---
+            combos = {}
+            uq1, uq2 = to_int(g(r, "馬複組番1")), to_int(g(r, "馬複組番2"))
+            if uq1 and uq2:
+                combos["馬複"] = (frozenset({uq1, uq2}),
+                                  to_int(g(r, "馬複払戻金（円）", "馬複払戻金(円)")))
+            ex1, ex2 = to_int(g(r, "馬単組番1")), to_int(g(r, "馬単組番2"))
+            if ex1 and ex2:
+                combos["馬単"] = ((ex1, ex2),
+                                  to_int(g(r, "馬単払戻金（円）", "馬単払戻金(円)")))
+            wides = []
+            for i in (1, 2, 3):
+                w1 = to_int(g(r, f"ワイド組番{i}馬番1"))
+                w2 = to_int(g(r, f"ワイド組番{i}馬番2"))
+                wp = to_int(g(r, f"ワイド払戻金{i}（円）", f"ワイド払戻金{i}(円)"))
+                if w1 and w2:
+                    wides.append((frozenset({w1, w2}), wp))
+            if wides:
+                combos["ワイド"] = wides
+            t1 = to_int(g(r, "３連複組番馬番1", "3連複組番馬番1"))
+            t2 = to_int(g(r, "３連複組番馬番2", "3連複組番馬番2"))
+            t3 = to_int(g(r, "３連複組番馬番3", "3連複組番馬番3"))
+            if t1 and t2 and t3:
+                combos["三連複"] = (frozenset({t1, t2, t3}),
+                                    to_int(g(r, "３連複払戻金（円）", "3連複払戻金(円)")))
+
             result[(place, race_no)] = {
                 "勝ち馬番": win_uma, "単勝払戻": pay, "複勝馬番": fuku,
+                "着順マップ": chaku, "組合せ払戻": combos,
             }
     return result
 
@@ -247,9 +291,25 @@ def find_sibling(horselist_path: Path, keyword: str):
       - 地方競馬: YYYYMMDD_horselist.csv → YYYYMMDD_payback.csv
       - 中央競馬: JRA_YYYY_MMDD_horselist.csv → JRA_YYYY_MMDD_payback.csv
     """
-    cand = Path(str(horselist_path).replace("horselist", keyword))
-    if cand != horselist_path and cand.exists():
-        return cand
+    hp = Path(horselist_path)
+    # ファイル名部分だけを置換する(親ディレクトリ名に 'horselist' が
+    # 含まれていても影響を受けないようにする)。
+    if "horselist" in hp.name:
+        cand = hp.with_name(hp.name.replace("horselist", keyword))
+        if cand != hp and cand.exists():
+            return cand
+    # フォールバック: 同じディレクトリ内で keyword を含むCSVを探す。
+    # 日付プレフィックスが一致するものを優先する。
+    import re
+    m = re.search(r"(20\d{2}[_-]?\d{2}[_-]?\d{2})", hp.name)
+    ymd = re.sub(r"[_-]", "", m.group(1)) if m else None
+    cands = sorted(hp.parent.glob(f"*{keyword}*.csv"))
+    if ymd:
+        for c in cands:
+            if ymd in re.sub(r"[_-]", "", c.name):
+                return c
+    if len(cands) == 1:
+        return cands[0]
     return None
 
 def detect_ymd_from_name(path, fallback=None):
@@ -317,6 +377,55 @@ def load_params():
 
 
 _PARAMS_FILE = load_params()
+
+
+# ============================================================
+# 予想スナップショット(確定)
+# ============================================================
+# 人気・オッズは締切まで変動するため、データを取得し直すたびに予想が
+# 変わってしまう問題への対策。最初に予想した時点のスコアをJSONに保存し、
+# 同じ開催日の再実行ではそのスコアを使って印・順位を固定する。
+# ※期待値買いは「確定した勝率 × 最新オッズ」で毎回再計算される(意図的)。
+
+def snapshot_file(horselist_path):
+    """horselistと同じディレクトリの確定ファイルパスを返す"""
+    hp = Path(horselist_path)
+    ymd = detect_ymd_from_name(hp, None) or "today"
+    return hp.parent / f"yosou_fixed_{ymd}.json"
+
+
+def load_snapshot(horselist_path):
+    f = snapshot_file(horselist_path)
+    if not f.exists():
+        return None
+    try:
+        import json as _json
+        return _json.loads(f.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def save_snapshot(horselist_path, races_scores):
+    """races_scores: {"場|R": {"scores": {"馬番": score}}} を保存"""
+    import json as _json
+    from datetime import datetime as _dt
+    f = snapshot_file(horselist_path)
+    data = {"確定時刻": _dt.now().strftime("%Y-%m-%d %H:%M"),
+            "races": races_scores}
+    f.write_text(_json.dumps(data, ensure_ascii=False, indent=1),
+                 encoding="utf-8")
+    return f
+
+
+def apply_snapshot(ranked, snap_scores):
+    """確定済みスコアを適用して並べ直す。
+    確定後に出走取消となった馬は自然に除外され、確定時に居なかった馬
+    (出走変更など)は計算済みスコアのまま末尾側に並ぶ。"""
+    for h in ranked:
+        s = snap_scores.get(str(h.umaban))
+        if s is not None:
+            h.score = float(s)
+    return sorted(ranked, key=lambda x: x.score, reverse=True)
 
 
 def merge_rec(a: Record, b: Record) -> Record:
@@ -424,19 +533,21 @@ def score_horse(h: Horse, info=None):
         score += 2
         reasons.append("減量騎手の恩恵あり")
 
+    # PARAMS["ninki"] が 0 のときは人気を一切参考にしない(加減点も根拠タグも無し)
     npt = PARAMS["ninki"]
-    if h.ninki == 1:
-        score += 12 * npt; reasons.append("1番人気の支持")
-    elif h.ninki == 2:
-        score += 8 * npt
-    elif h.ninki == 3:
-        score += 5 * npt
-    elif 4 <= h.ninki <= 6:
-        score += 1 * npt
-    elif 7 <= h.ninki <= 9:
-        score -= 4 * npt
-    elif h.ninki >= 10:
-        score -= 8 * npt
+    if npt != 0:
+        if h.ninki == 1:
+            score += 12 * npt; reasons.append("1番人気の支持")
+        elif h.ninki == 2:
+            score += 8 * npt
+        elif h.ninki == 3:
+            score += 5 * npt
+        elif 4 <= h.ninki <= 6:
+            score += 1 * npt
+        elif 7 <= h.ninki <= 9:
+            score -= 4 * npt
+        elif h.ninki >= 10:
+            score -= 8 * npt
 
     if h.weight > 0 and h.weight_diff != 0:
         ratio = abs(h.weight_diff) / h.weight
@@ -470,6 +581,118 @@ def adjust_kinryo(horses):
                 h.reasons.append("ハンデ差(軽量)は大きな武器")
             elif adj <= -4:
                 h.reasons.append("重い負担重量がカギ")
+
+
+# ============================================================
+# 印からの組合せ馬券 期待値計算(馬単・馬複・ワイド・三連複)
+# ============================================================
+# モデル勝率(model_probs)と市場勝率(オッズ/人気由来)からHarville法で
+# 各組合せの的中確率を求め、推定配当(払戻率/市場確率)と掛けて期待値を出す。
+# 単勝の期待値買いと同じ「モデルと市場の見解が割れた組合せ」を拾う考え方。
+
+COMBO_PAYOUT = {  # 券種別の払戻率(概算)
+    True:  {"馬複": 0.775, "馬単": 0.75, "ワイド": 0.775, "三連複": 0.75},   # 中央
+    False: {"馬複": 0.75,  "馬単": 0.75, "ワイド": 0.75,  "三連複": 0.725},  # 地方
+}
+
+
+def _market_prob_map(ranked, payout):
+    """市場の勝率マップ {馬番: p}。実オッズがあれば1/オッズ比例、無ければ人気Zipf"""
+    om = estimate_odds_map(ranked, payout)
+    raw = {u: 1.0 / o for u, (o, _real) in om.items()}
+    s = sum(raw.values())
+    return {u: v / s for u, v in raw.items()}
+
+
+def _harville_pair(p, a, b):
+    """a→b(馬単)の確率"""
+    return p[a] * p[b] / max(1e-9, 1 - p[a])
+
+
+def _harville_top3(p_map):
+    """全馬の順序付き3着以内を列挙し、
+    (三連複setの確率dict, ワイドpairの確率dict) を返す"""
+    from itertools import permutations
+    umas = list(p_map)
+    trio = {}
+    wide = {}
+    for a, b, c in permutations(umas, 3):
+        pa, pb, pc = p_map[a], p_map[b], p_map[c]
+        pr = pa * pb / max(1e-9, 1 - pa) * pc / max(1e-9, 1 - pa - pb)
+        key3 = frozenset({a, b, c})
+        trio[key3] = trio.get(key3, 0.0) + pr
+    for key3, pr in trio.items():
+        for pair in ({x, y} for x in key3 for y in key3 if x < y):
+            fk = frozenset(pair)
+            wide[fk] = wide.get(fk, 0.0) + pr
+    return trio, wide
+
+
+def ev_combo_bets(ranked, threshold=100.0, jra=False, top_n=4, per_type=2):
+    """印上位top_n頭の組合せから、期待値がしきい値以上の買い目を返す。
+    戻り値: [{"券種","組","確率","推定配当","ev"}...](期待値降順)"""
+    if len(ranked) < 3:
+        return []
+    payout_win = TAKEOUT_RETURN_JRA if jra else TAKEOUT_RETURN
+    pm = dict(zip((h.umaban for h in ranked), model_probs(ranked)))
+    pk = _market_prob_map(ranked, payout_win)
+    rates = COMBO_PAYOUT[bool(jra)]
+    tops = [h.umaban for h in ranked[:top_n]]
+
+    m_trio, m_wide = _harville_top3(pm)
+    k_trio, k_wide = _harville_top3(pk)
+
+    from itertools import combinations, permutations
+    cands = []
+
+    def add(kind, key, disp, p_model, p_mkt):
+        if p_model <= 0 or p_mkt <= 0:
+            return
+        est = rates[kind] / p_mkt
+        ev = p_model * est * 100
+        if ev >= threshold:
+            cands.append({"券種": kind, "組": key, "表示": disp,
+                          "確率": p_model, "推定配当": est, "ev": ev})
+
+    for a, b in combinations(tops, 2):
+        add("馬複", frozenset({a, b}), f"{a}-{b}",
+            _harville_pair(pm, a, b) + _harville_pair(pm, b, a),
+            _harville_pair(pk, a, b) + _harville_pair(pk, b, a))
+        add("ワイド", frozenset({a, b}), f"{a}-{b}",
+            m_wide.get(frozenset({a, b}), 0), k_wide.get(frozenset({a, b}), 0))
+    for a, b in permutations(tops, 2):
+        add("馬単", (a, b), f"{a}→{b}",
+            _harville_pair(pm, a, b), _harville_pair(pk, a, b))
+    for combo in combinations(tops, 3):
+        key = frozenset(combo)
+        disp = "-".join(str(x) for x in sorted(combo))
+        add("三連複", key, disp, m_trio.get(key, 0), k_trio.get(key, 0))
+
+    # 券種ごとに上位per_typeに絞り、全体を期待値降順で返す
+    cands.sort(key=lambda x: -x["ev"])
+    out, count = [], {}
+    for c in cands:
+        k = c["券種"]
+        if count.get(k, 0) >= per_type:
+            continue
+        count[k] = count.get(k, 0) + 1
+        out.append(c)
+    return out
+
+
+def combo_hit(pick, payback):
+    """組合せ買い目の的中判定。的中なら実払戻金、外れなら0を返す(判定不能はNone)"""
+    combos = (payback or {}).get("組合せ払戻", {})
+    kind, key = pick["券種"], pick["組"]
+    if kind == "ワイド":
+        for fs, pay in combos.get("ワイド", []):
+            if fs == key:
+                return pay
+        return 0 if combos.get("ワイド") else None
+    entry = combos.get(kind)
+    if entry is None:
+        return None
+    return entry[1] if entry[0] == key else 0
 
 
 MARKS = ["◎", "○", "▲", "△", "☆"]
@@ -621,6 +844,9 @@ class KeibaApp(tk.Tk):
         ttk.Label(flt, text="%以上").pack(side="left", padx=(2, 12))
         self.run_btn = ttk.Button(flt, text="🏇 予想実行", command=self.run_prediction, state="disabled")
         self.run_btn.pack(side="left", padx=4)
+        self.refreeze_btn = ttk.Button(flt, text="🔓 予想を再確定", command=self.refreeze,
+                                       state="disabled")
+        self.refreeze_btn.pack(side="left", padx=4)
         self.save_txt_btn = ttk.Button(flt, text="💾 テキスト保存", command=self.save_text, state="disabled")
         self.save_txt_btn.pack(side="left", padx=4)
         self.save_json_btn = ttk.Button(flt, text="💾 JSON保存", command=self.save_json, state="disabled")
@@ -1005,15 +1231,27 @@ class KeibaApp(tk.Tk):
         self.predictions = {}
         self.tree.delete(*self.tree.get_children())
 
+        # --- 予想スナップショット(確定)の読み込み ---
+        snap = load_snapshot(self.horselist_path) if self.horselist_path else None
+        snap_races = (snap or {}).get("races", {})
+        new_snapshot = {}
+
         hits = fuku_hits = graded = ret = 0
         ev_bets_n = ev_hits = ev_invest = ev_ret = ev_skip = 0
         for key in sorted(races, key=lambda k: (k[0], k[1])):
             info = self.race_info.get(key, {})
             jra = is_jra(key[0])
             ranked = predict_race(races[key], info)
+            skey = f"{key[0]}|{key[1]}"
+            if skey in snap_races:
+                # 確定済みスコアで順位を固定(期待値買いは最新オッズで再計算される)
+                ranked = apply_snapshot(ranked, snap_races[skey].get("scores", {}))
+            new_snapshot[skey] = {"scores": {str(h.umaban): round(h.score, 2)
+                                             for h in ranked}}
             conf_text, conf_rank = confidence_label(ranked)
             payout = TAKEOUT_RETURN_JRA if jra else TAKEOUT_RETURN
             picks = ev_bets(ranked, ev_threshold, payout)
+            combo_picks = ev_combo_bets(ranked, ev_threshold, jra)
             ev_s = ("単勝 " + ",".join(str(p["horse"].umaban) for p in picks)) if picks else "見送り"
             pb = self.paybacks.get(key)
             hit = fuku_hit = None
@@ -1046,6 +1284,7 @@ class KeibaApp(tk.Tk):
                 "ranked": ranked, "conf": (conf_text, conf_rank),
                 "payback": pb, "hit": hit, "fuku_hit": fuku_hit,
                 "ev_picks": picks, "ev_threshold": ev_threshold,
+                "combo_picks": combo_picks,
                 "jra": jra,
             }
             self.tree.insert("", "end", iid=f"{key[0]}|{key[1]}",
@@ -1055,16 +1294,32 @@ class KeibaApp(tk.Tk):
                                      conf_rank, ev_s, result_s),
                              tags=tag)
 
+        # --- 未確定なら今回の予想を確定保存 ---
+        frozen_label = ""
+        if self.horselist_path:
+            if snap is None:
+                try:
+                    f = save_snapshot(self.horselist_path, new_snapshot)
+                    frozen_label = "🔒予想を確定しました "
+                    self._log(f"🔒 本日の予想を確定しました: {f.name}\n"
+                              "   以後、データを取得し直しても印・順位は変わりません。\n"
+                              "   (期待値買いは最新オッズで再計算されます)\n")
+                except Exception:
+                    pass
+            else:
+                frozen_label = f"🔒確定済み({snap.get('確定時刻', '')}) "
+            self.refreeze_btn.config(state="normal")
+
         n = len(self.predictions)
         if graded:
             ev_recov = ev_ret / ev_invest * 100 if ev_invest else 0
             self.status.config(
-                text=f"予想完了: {n}レース | 終了{graded}Rの答え合わせ → "
+                text=f"{frozen_label}予想完了: {n}レース | 終了{graded}Rの答え合わせ → "
                      f"◎単勝{hits}/{graded}・3着内{fuku_hits}/{graded} | "
                      f"💰期待値買い(閾値{ev_threshold:.0f}%): {ev_bets_n}点購入(見送り{ev_skip}R)・"
                      f"的中{ev_hits}・投資{ev_invest}円→払戻{ev_ret}円(回収率{ev_recov:.0f}%) | 参考予想です🐴")
         else:
-            self.status.config(text=f"予想完了: {n}レース。一覧をクリックすると詳細を表示します | 参考予想です🐴")
+            self.status.config(text=f"{frozen_label}予想完了: {n}レース。一覧をクリックすると詳細を表示します | 参考予想です🐴")
 
         self.save_txt_btn.config(state="normal")
         self.save_json_btn.config(state="normal")
@@ -1073,6 +1328,25 @@ class KeibaApp(tk.Tk):
         if first:
             self.tree.selection_set(first[0])
             self.tree.see(first[0])
+
+    # ---------- 予想の再確定 ----------
+    def refreeze(self):
+        if not self.horselist_path:
+            return
+        f = snapshot_file(self.horselist_path)
+        msg = ("現在の確定済み予想を破棄し、最新データで予想を作り直して\n"
+               "確定し直します(印・順位が変わる可能性があります)。\n\nよろしいですか?")
+        if not messagebox.askokcancel("予想を再確定", msg):
+            return
+        try:
+            if f.exists():
+                f.unlink()
+        except OSError as e:
+            messagebox.showerror("削除失敗", str(e))
+            return
+        self._log_clear()
+        self._log("🔓 確定を解除しました。最新データで予想を作り直します...\n")
+        self.run_prediction()
 
     # ---------- 詳細表示 ----------
     def on_select_race(self, _event=None):
@@ -1125,12 +1399,20 @@ class KeibaApp(tk.Tk):
         for r in top.reasons[:3] or ["総合力で一枚上と見た!"]:
             t.insert("end", f"   ・{r}\n", "chat")
         t.insert("end", "\n📋 印まとめ:\n", "chat")
+        chaku_map = (p["payback"] or {}).get("着順マップ", {}) if p.get("payback") else {}
         for i, h in enumerate(ranked):
             mark = MARKS[i] if i < len(MARKS) else "  "
             ninki_s = f"{h.ninki}人気" if h.ninki > 0 else "-"
             line = (f" {mark} {h.umaban:>2}番 {h.name:<12} "
-                    f"スコア{h.score:6.1f} ({ninki_s}/{h.jockey})\n")
+                    f"スコア{h.score:6.1f} ({ninki_s}/{h.jockey})")
             t.insert("end", line, "mark0" if i == 0 else "chat")
+            res = chaku_map.get(h.umaban)
+            if res:
+                tag = "hit" if res == "1着" else "kai"
+                t.insert("end", f"  → {res}", tag)
+            elif chaku_map:
+                t.insert("end", "  → 圏外", "miss")
+            t.insert("end", "\n", "chat")
 
         if len(ranked) >= 3:
             a, b, c = ranked[0].umaban, ranked[1].umaban, ranked[2].umaban
@@ -1157,6 +1439,17 @@ class KeibaApp(tk.Tk):
             t.insert("end", "   このレースは期待値が閾値に届かず【見送り】。\n"
                             "   買わない判断も回収率アップの立派な戦略だよ!\n", "chat")
 
+        # --- 印からの組合せ期待値買い ---
+        combos = p.get("combo_picks", [])
+        if combos:
+            t.insert("end", f"🎲 組合せ期待値買い(印上位の組合せ・閾値{thr:.0f}%):\n", "honmei")
+            for c in combos:
+                t.insert("end",
+                         f"   [{c['券種']}] {c['表示']}  的中確率{c['確率']:.1%} × "
+                         f"推定{c['推定配当']:.1f}倍 = 期待値{c['ev']:.0f}%\n", "kai")
+            t.insert("end", "   ※組合せの推定配当はモデル計算による概算です。"
+                            "点数の買いすぎに注意\n", "meta")
+
         pb = p["payback"]
         if pb:
             win = pb["勝ち馬番"]
@@ -1175,6 +1468,63 @@ class KeibaApp(tk.Tk):
                 rank_s = f"(予想{rank}位評価)" if rank else ""
                 t.insert("end", f"❌ 結果: 勝ったのは{win}番{win_name}{rank_s}。"
                                 f"◎は外れ…次いくよ!\n", "miss")
+
+            # --- 印と結果の対照 ---
+            cm = pb.get("着順マップ", {})
+            pairs = []
+            in_ken = 0
+            for i, h in enumerate(ranked[:5]):
+                mark = MARKS[i] if i < len(MARKS) else ""
+                res = cm.get(h.umaban, "圏外")
+                if h.umaban in cm:
+                    in_ken += 1 if i < 3 else 0
+                pairs.append(f"{mark}→{res}")
+            t.insert("end", "🏅 印別結果: " + " ／ ".join(pairs) + "\n", "chat")
+            t.insert("end", f"   印上位3頭(◎○▲)のうち{in_ken}頭が馬券圏内(3着以内)\n",
+                     "hit" if in_ken >= 2 else "chat")
+
+            # --- 期待値買いの結果・収支 ---
+            picks = p.get("ev_picks", [])
+            if picks:
+                lines = []
+                total_in = total_out = 0
+                for pk in picks:
+                    u = pk["horse"].umaban
+                    total_out += 100
+                    if u == win:
+                        total_in += pb["単勝払戻"]
+                        lines.append(f"単勝{u}番: 的中🎯 +{pb['単勝払戻'] - 100}円")
+                    elif u in cm:
+                        lines.append(f"単勝{u}番: {cm[u]}(単勝は外れ)")
+                    else:
+                        lines.append(f"単勝{u}番: 外れ")
+                net = total_in - total_out
+                tag = "hit" if net > 0 else ("kai" if total_in > 0 else "miss")
+                t.insert("end", f"💰 期待値買い結果: {' ／ '.join(lines)}\n", "chat")
+                t.insert("end", f"   このレース収支(100円/点): "
+                                f"{'+' if net >= 0 else ''}{net}円\n", tag)
+
+            # --- 組合せ買いの結果 ---
+            combos_p = p.get("combo_picks", [])
+            if combos_p:
+                clines, c_in, c_out = [], 0, 0
+                for c in combos_p:
+                    hitpay = combo_hit(c, pb)
+                    if hitpay is None:
+                        clines.append(f"[{c['券種']}]{c['表示']}: 判定不能")
+                        continue
+                    c_out += 100
+                    if hitpay > 0:
+                        c_in += hitpay
+                        clines.append(f"[{c['券種']}]{c['表示']}: 的中🎯+{hitpay - 100}円")
+                    else:
+                        clines.append(f"[{c['券種']}]{c['表示']}: 外れ")
+                cnet = c_in - c_out
+                ctag = "hit" if cnet > 0 else ("kai" if c_in > 0 else "miss")
+                t.insert("end", f"🎲 組合せ買い結果: {' ／ '.join(clines)}\n", "chat")
+                if c_out:
+                    t.insert("end", f"   組合せ収支(100円/点): "
+                                    f"{'+' if cnet >= 0 else ''}{cnet}円\n", ctag)
 
         t.insert("end", "\n※あくまで参考予想です。馬券は余裕資金の範囲で🐴\n", "meta")
         t.config(state="disabled")
