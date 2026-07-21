@@ -811,10 +811,10 @@ class KeibaApp(tk.Tk):
         ttk.Button(top, text="📂 出馬表CSVを開く", command=self.open_csv).pack(side="left")
         self.jra_btn = ttk.Button(top, text="🌐 JRAから取得", command=self.fetch_from_jra)
         self.jra_btn.pack(side="left", padx=(6, 0))
-        self.nar_btn = ttk.Button(top, text="🏇 地方データ取得", command=self.fetch_from_nar)
-        self.nar_btn.pack(side="left", padx=(6, 0))
         self.result_btn = ttk.Button(top, text="🏁 JRA結果取得", command=self.fetch_results_jra)
         self.result_btn.pack(side="left", padx=(6, 0))
+        self.nar_btn = ttk.Button(top, text="🏇 地方競馬データ取得", command=self.fetch_from_nar)
+        self.nar_btn.pack(side="left", padx=(6, 0))
         self.tune_btn = ttk.Button(top, text="📈 結果から学習", command=self.tune_from_results,
                                    state="disabled")
         self.tune_btn.pack(side="left", padx=(6, 0))
@@ -849,8 +849,8 @@ class KeibaApp(tk.Tk):
         self.refreeze_btn.pack(side="left", padx=4)
         self.save_txt_btn = ttk.Button(flt, text="💾 テキスト保存", command=self.save_text, state="disabled")
         self.save_txt_btn.pack(side="left", padx=4)
-        self.save_json_btn = ttk.Button(flt, text="💾 JSON保存", command=self.save_json, state="disabled")
-        self.save_json_btn.pack(side="left", padx=4)
+        # self.save_json_btn = ttk.Button(flt, text="💾 JSON保存", command=self.save_json, state="disabled")
+        # self.save_json_btn.pack(side="left", padx=4)
 
         # --- 中央: 左レース一覧 / 右チャット表示 ---
         paned = ttk.PanedWindow(self, orient="horizontal")
@@ -1567,6 +1567,13 @@ class KeibaApp(tk.Tk):
                 lines.append(f"  💰期待値買い(単勝): {pick_s}")
             else:
                 lines.append("  💰期待値買い: 見送り")
+            combos = p.get("combo_picks", [])
+            if combos:
+                combo_s = " / ".join(
+                    f"[{c['券種']}]{c['表示']}(的中確率{c['確率']:.1%}×推定{c['推定配当']:.1f}倍"
+                    f"=期待値{c['ev']:.0f}%)"
+                    for c in combos)
+                lines.append(f"  🎲組合せ期待値買い: {combo_s}")
             if p["payback"]:
                 mark = "◎的中!" if p["hit"] else ("複勝圏" if p["fuku_hit"] else "外れ")
                 lines.append(f"  結果: 勝ち馬{p['payback']['勝ち馬番']}番 → {mark}")
