@@ -18,6 +18,7 @@ hidden = [
     "tune_params",
     "download_race_data",
     "post_wordpress",
+    "deba_table",
 ]
 
 a = Analysis(

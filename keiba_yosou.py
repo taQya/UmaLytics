@@ -32,6 +32,8 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import deba_table   # 出馬表ページ(CSVに無い過去5走など)の収集とスコア補正
+
 
 # ============================================================
 # ユーティリティ
@@ -134,6 +136,8 @@ class Horse:
     last3: list = field(default_factory=list)  # 直近3走の着順(新しい順)
     jockey_affili: str = ""        # 騎手所属(JRA/大井など)
     trainer_affili: str = ""       # 調教師所属
+    race_date: str = ""            # 競走年月日 YYYYMMDD
+    deba: dict = field(default_factory=dict)  # 出馬表ページ由来の情報(過去5走など)
     score: float = 0.0
     reasons: list = field(default_factory=list)
     scratched: bool = False         # 出走取消/除外など(人気なし)
@@ -197,6 +201,7 @@ def load_horselist(path: Path):
                    for k in ("前走着順", "2走前着順", "3走前着順")],
             jockey_affili=str(g(r, "騎手所属", default="") or "").strip(),
             trainer_affili=str(g(r, "調教師所属", "厩舎所属", default="") or "").strip(),
+            race_date=str(g(r, "競走年月日", default="") or "").strip(),
             scratched=(ninki <= 0),
         ))
         st = str(g(r, "状態", default="") or "")
@@ -207,6 +212,7 @@ def load_horselist(path: Path):
             h.scratched = False
     if not horses:
         raise ValueError("horselistから有効な出走データを読み込めませんでした")
+    deba_table.attach(horses, path)   # 出馬表ページ由来の情報(キャッシュがあれば)
     return horses
 
 
@@ -411,6 +417,8 @@ PARAMS = {
     "softmax_t": 10.0,   # スコア→勝率の温度
     "jra_affili": 8.0,   # JRA所属馬への加点(交流重賞での実力差を考慮)
 }
+# 出馬表ページ由来の重み(deba_recent/margin/agari/pace/interval/jockey)
+PARAMS.update(deba_table.PARAMS_DEFAULT)
 
 
 def app_dir():
@@ -611,6 +619,7 @@ def predict_race(horses, info=None):
     for h in horses:
         score_horse(h, info)
     adjust_kinryo(horses)
+    deba_table.adjust(horses, PARAMS)   # 近走・脚質はレース内相対で効かせる
     return sorted(horses, key=lambda x: x.score, reverse=True)
 
 

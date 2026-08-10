@@ -37,11 +37,18 @@ SEARCH_SPACE = {
     "total_fuku": (0.0, 50.0),
     "recent":     (0.0, 2.0),
     "apt":        (0.0, 2.5),
-    "jockey":     (0.0, 2.5),
-    "ninki":      (0.0, 2.5),
+    "jockey":     (0.0, 3.0),
+    "ninki":      (0.0, 1.5),
     "kinryo":     (0.0, 500.0),
     "softmax_t":  (4.0, 25.0),
     "jra_affili":  (0.0, 20.0),
+    # 出馬表ページ由来(deba_table.py)。キャッシュが無い日は効かないので0付近に落ちる
+    "deba_recent":   (0.0, 25.0),
+    "deba_margin":   (0.0, 8.0),
+    "deba_agari":    (0.0, 8.0),
+    "deba_pace":     (0.0, 8.0),
+    "deba_interval": (0.0, 5.0),
+    "deba_jockey":   (0.0, 6.0),
 }
 
 
@@ -117,10 +124,26 @@ def tune(files, iters=300, objective="hits", seed=42, progress=print):
     if n_races < 30:
         progress("⚠ レース数が少なめです。1日分だけの調整は過学習しやすいので、")
         progress("   複数週のデータを貯めてから再調整するのがおすすめです。")
+    if n_races < 1500:
+        progress(f"⚠ 探索次元が{len(SEARCH_SPACE)}個あるため、レース数が少ないうちは"
+                 "--iters を増やす(1000以上推奨)か、複数週分のデータを貯めてから"
+                 "の調整をおすすめします。")
+
+    n_horses = sum(len(rh) for rh, _, _ in dataset)
+    n_deba = sum(1 for rh, _, _ in dataset for h in rh if h.deba)
+    progress(f"📋 出馬表データの紐付け: {n_deba}/{n_horses}頭 "
+             f"({n_deba / n_horses:.0%})")
+    if not n_deba:
+        progress("   ※ deba_table.py で取得すると近走・脚質の指標が使えます")
 
     defaults = dict(eng.PARAMS)
     base = evaluate(dataset, defaults)
-    progress(f"\n📊 調整前: ◎的中 {base[0]}/{base[3]} "
+    # 出馬表由来の重みを0にした成績。この差が「収集したデータの効き」になる
+    off = dict(defaults, **{k: 0.0 for k in defaults if k.startswith("deba_")})
+    base_off = evaluate(dataset, off)
+    progress(f"\n📊 出馬表データ不使用: ◎的中 {base_off[0]}/{base_off[3]} "
+             f"/ 勝ち馬の平均予想順位 {base_off[1]:.2f}位 / EV回収率 {base_off[2]:.0f}%")
+    progress(f"📊 調整前(初期値): ◎的中 {base[0]}/{base[3]} "
              f"/ 勝ち馬の平均予想順位 {base[1]:.2f}位 / EV回収率 {base[2]:.0f}%")
 
     rng = random.Random(seed)
@@ -141,7 +164,10 @@ def tune(files, iters=300, objective="hits", seed=42, progress=print):
     eng.PARAMS.update(defaults)  # エンジンを元に戻す
     progress(f"\n📊 調整後(学習データ上): ◎的中 {best_r[0]}/{best_r[3]} "
              f"/ 勝ち馬の平均予想順位 {best_r[1]:.2f}位 / EV回収率 {best_r[2]:.0f}%")
-    return best_p, base, best_r, n_races
+    progress(f"   出馬表データ不使用との差: ◎的中 {best_r[0] - base_off[0]:+d} "
+             f"/ 平均順位 {best_r[1] - base_off[1]:+.2f} "
+             f"/ 回収率 {best_r[2] - base_off[2]:+.0f}%")
+    return best_p, base, best_r, n_races, base_off
 
 
 def save_params(params, meta, path=None):
@@ -162,12 +188,14 @@ def main():
     ap.add_argument("--out", type=Path, default=None, help="保存先(デフォルト: keiba_params.json)")
     args = ap.parse_args()
     try:
-        best_p, base, best_r, n = tune(args.horselists, args.iters, args.objective)
+        best_p, base, best_r, n, base_off = tune(
+            args.horselists, args.iters, args.objective)
     except RuntimeError as e:
         print(f"❌ {e}", file=sys.stderr)
         sys.exit(1)
     meta = {"学習レース数": n, "調整前_的中": base[0], "調整後_的中": best_r[0],
             "調整前_回収率": round(base[2]), "調整後_回収率": round(best_r[2]),
+            "出馬表なし_的中": base_off[0], "出馬表なし_回収率": round(base_off[2]),
             "注意": "学習データ上の成績です。未来の的中を保証しません"}
     path = save_params(best_p, meta, args.out)
     print(f"\n💾 保存しました: {path}")
