@@ -33,6 +33,7 @@ from tkinter import filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 
 import deba_table   # 出馬表ページ(CSVに無い過去5走など)の収集とスコア補正
+import horse_stats  # horses.sqlite3(馬の生涯レース履歴)由来のスコア補正
 
 
 # ============================================================
@@ -138,6 +139,7 @@ class Horse:
     trainer_affili: str = ""       # 調教師所属
     race_date: str = ""            # 競走年月日 YYYYMMDD
     deba: dict = field(default_factory=dict)  # 出馬表ページ由来の情報(過去5走など)
+    db: dict = field(default_factory=dict)    # horses.sqlite3由来の生涯レース履歴(初回のみ取得)
     score: float = 0.0
     reasons: list = field(default_factory=list)
     scratched: bool = False
@@ -357,6 +359,8 @@ PARAMS = {
 }
 # 出馬表ページ由来の重み(deba_recent/margin/agari/pace/interval/jockey)
 PARAMS.update(deba_table.PARAMS_DEFAULT)
+# horses.sqlite3(生涯レース履歴)由来の重み(db_recent/dist/jockey/interval)
+PARAMS.update(horse_stats.PARAMS_DEFAULT)
 
 
 def app_dir():
@@ -725,6 +729,7 @@ def predict_race(horses, info=None):
         score_horse(h, info)
     adjust_kinryo(horses)
     deba_table.adjust(horses, PARAMS)   # 近走・脚質はレース内相対で効かせる
+    horse_stats.adjust(horses, info, PARAMS)  # 生涯レース履歴由来の補正
     return sorted(horses, key=lambda x: x.score, reverse=True)
 
 

@@ -35,7 +35,10 @@ except ImportError:
 
 BASE = "https://www.keiba.go.jp/KeibaWeb/TodayRaceInfo/DebaTable"
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-SLEEP = 1.0          # サーバー負荷防止のリクエスト間隔(秒)
+SLEEP = 10.0         # リクエスト間隔(秒)。keiba.go.jp の robots.txt が Crawl-delay: 10 を
+                     # 指定しているため、それに合わせている(このモジュールが使う
+                     # /KeibaWeb/TodayRaceInfo/ 自体はrobots.txtでは全bot対象にDisallow
+                     # 指定されている。個人利用の範囲での手動〜低頻度実行にとどめること)
 PAST_COLS = 5        # 出馬表に載る過去走の数(前走〜5走前)
 
 # 競馬場名 → babaCode。月別開催日程ページ(MonthlyConveneInfo)の対応表。

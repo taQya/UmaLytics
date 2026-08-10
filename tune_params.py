@@ -49,6 +49,12 @@ SEARCH_SPACE = {
     "deba_pace":     (0.0, 8.0),
     "deba_interval": (0.0, 5.0),
     "deba_jockey":   (0.0, 6.0),
+    # horses.sqlite3(生涯レース履歴)由来。DBが無い/紐付かない馬は効かないので
+    # その場合は0付近に落ちる
+    "db_recent":     (0.0, 20.0),
+    "db_dist":       (0.0, 3.0),
+    "db_jockey":     (0.0, 3.0),
+    "db_interval":   (0.0, 5.0),
 }
 
 
@@ -137,11 +143,19 @@ def tune(files, iters=300, objective="hits", seed=42, progress=print):
         progress("   ※ deba_table.py で取得すると近走・脚質の指標が使えます")
 
     defaults = dict(eng.PARAMS)
-    base = evaluate(dataset, defaults)
-    # 出馬表由来の重みを0にした成績。この差が「収集したデータの効き」になる
-    off = dict(defaults, **{k: 0.0 for k in defaults if k.startswith("deba_")})
+    base = evaluate(dataset, defaults)  # この時点で h.db(生涯レース履歴)もキャッシュされる
+    n_db = sum(1 for rh, _, _ in dataset for h in rh if (h.db or {}).get("races"))
+    progress(f"📋 horses.sqlite3の紐付け: {n_db}/{n_horses}頭 "
+             f"({n_db / n_horses:.0%})")
+    if not n_db:
+        progress("   ※ horse_db.py --fetch で馬データを蓄積すると近走・距離適性・"
+                 "騎手コンビ等の指標が使えます")
+
+    # 出馬表/DB由来の重みを0にした成績。この差が「収集したデータの効き」になる
+    off = dict(defaults, **{k: 0.0 for k in defaults
+                             if k.startswith("deba_") or k.startswith("db_")})
     base_off = evaluate(dataset, off)
-    progress(f"\n📊 出馬表データ不使用: ◎的中 {base_off[0]}/{base_off[3]} "
+    progress(f"\n📊 出馬表・DB不使用: ◎的中 {base_off[0]}/{base_off[3]} "
              f"/ 勝ち馬の平均予想順位 {base_off[1]:.2f}位 / EV回収率 {base_off[2]:.0f}%")
     progress(f"📊 調整前(初期値): ◎的中 {base[0]}/{base[3]} "
              f"/ 勝ち馬の平均予想順位 {base[1]:.2f}位 / EV回収率 {base[2]:.0f}%")
@@ -164,7 +178,7 @@ def tune(files, iters=300, objective="hits", seed=42, progress=print):
     eng.PARAMS.update(defaults)  # エンジンを元に戻す
     progress(f"\n📊 調整後(学習データ上): ◎的中 {best_r[0]}/{best_r[3]} "
              f"/ 勝ち馬の平均予想順位 {best_r[1]:.2f}位 / EV回収率 {best_r[2]:.0f}%")
-    progress(f"   出馬表データ不使用との差: ◎的中 {best_r[0] - base_off[0]:+d} "
+    progress(f"   出馬表・DB不使用との差: ◎的中 {best_r[0] - base_off[0]:+d} "
              f"/ 平均順位 {best_r[1] - base_off[1]:+.2f} "
              f"/ 回収率 {best_r[2] - base_off[2]:+.0f}%")
     return best_p, base, best_r, n_races, base_off

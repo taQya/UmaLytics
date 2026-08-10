@@ -49,6 +49,7 @@ horselist内の「着順」「タイム」列は結果データなので**予想
 | `fetch_jra.py` | JRA公式サイトから出馬表(`--results`で結果)を取得するモジュール |
 | `download_race_data.py` | 地方競馬(keiba.go.jp)の当日出走データをDL・解凍・読込 |
 | `deba_table.py` | 出馬表ページからCSVに無い馬情報(過去5走など)を収集・スコア補正 |
+| `horse_db.py` | 馬ごとの生涯レース履歴・血統・プロフィールをSQLiteに蓄積 |
 | `tune_params.py` | 結果データから予想パラメータを自動調整(→keiba_params.json) |
 | `post_wordpress.py` / `run_daily.bat` / `wp_config.sample.json` | WordPress毎日自動投稿 |
 | `spat4_bet.py` | 期待値しきい値超えの単勝でSPAT4投票リストを生成(投票確定は手動) |
@@ -110,6 +111,48 @@ python deba_table.py horselist/*_horselist.csv            :: まとめて(過去
 - 中央競馬(JRA)は対象外です
 
 これで作られる指標は「近走の着順点」「着差」「上がり3F」「コーナー通過順から見た先行力」「レース間隔」「継続騎乗」の6つで、着差・上がり・先行力はレース内で標準化してから比較します。重みは `keiba_params.json` の `deba_*` で、`tune_params.py` から自動調整できます。
+
+## 🗄 馬データベース(生涯成績・血統の蓄積)
+
+`deba_table.py` の出馬表ページは直近5走までだが、keiba.go.jp には馬ごとに**生涯の全レース履歴**と**血統・生産者・馬主などのプロフィール**を見られるページがある。`horse_db.py` はここから取得してSQLite(`horses.sqlite3`)に蓄積する。
+
+```bat
+:: 1) 血統登録番号を集める(通信なし。deba_table.pyのキャッシュから収集)
+python horse_db.py --seed
+
+:: 2) 未取得/古い馬のデータを取得してDBに追加(1頭2リクエスト・1秒間隔)
+python horse_db.py --fetch
+python horse_db.py --fetch --limit 200      :: 様子見に件数を絞る
+
+:: 状況確認(引数なし)
+python horse_db.py
+```
+
+- `horses` テーブル: 生年月日・毛色・調教師(所属)・馬主・産地・生産牧場・3代血統(父/父父/父母/母/母父/母母)・収得賞金
+- `races` テーブル: 生涯の全レース(日付・競馬場・レース名・格・距離・天候・馬場・頭数・枠番・馬番・人気・着順・タイム・着差・上がり3F・馬体重・騎手(所属)・斤量・調教師・収得賞金・1着馬/2着馬)
+- 勝率や距離別成績などの集計値は持たない。`races` テーブルにSQLで問い合わせれば計算できるため(例: `SELECT track, COUNT(*), AVG(chaku<=3) FROM races WHERE lineage_code=... GROUP BY track`)
+- 既に新鮮なデータ(既定7日以内に取得済み)がある馬は自動でスキップするので、2回目以降は差分だけで済む
+- 初回は血統登録番号の数に応じて数時間かかる(例: 7000頭で約4時間)。中断しても再実行すれば続きから取得する
+
+現時点では予想スコアには使っていない参考データベース。血統・生産者・距離別成績など、`deba_table.py` の6指標とは別軸の特徴量を今後追加する際の土台になる。
+
+**注意**: 血統登録番号は地方競馬の出馬表ページ経由でしか集めていないため、このDBに入るのは「地方競馬の出馬表に登場した馬」に限られる。それらの馬がJRA交流競走で走った記録(トラック名が「Ｊ○○」表記)は含まれるが、地方に一度も来ない純粋なJRA所属馬のデータは対象外。
+
+### 毎日の自動更新
+
+`horse_db.py --daily` は、その日の地方競馬データを取得 → 出馬表データ収集 → **その日出走した馬(+初見の馬)だけ** をDBに反映する。`--fetch`(7日以上古い馬を一律再取得)と違い、毎日回しても取得件数がまとまって膨れ上がらない。
+
+**注意(robots.txt)**: keiba.go.jp の `robots.txt` は `Crawl-delay: 10` を指定しており、かつ本ツールが使う `/KeibaWeb/TodayRaceInfo/` `/KeibaWeb/DataRoom/` `/KeibaWeb/DataDownload/` を全bot対象に明示的に `Disallow` している。これに合わせて `deba_table.py` の `SLEEP` は10秒にしてある(以前は1秒だったが変更済み)。1日あたり出走馬300〜500頭として**2〜3時間程度**かかる計算になるので、深夜〜早朝の時間帯に実行することを想定している。クラウド等この端末以外での実行は行わない(データセンターIPは検知・遮断されやすい上、そもそもrobots.txtが禁止しているページへの自動アクセスである点は場所によらず変わらないため)。
+
+```bat
+python horse_db.py --daily
+```
+
+`run_horse_db_daily.bat` をタスクスケジューラに登録すれば自動化できる(地方競馬は開催場により21〜22時頃まで走るため、23時以降を推奨):
+
+```bat
+schtasks /create /tn "KeibaHorseDBDaily" /tr "C:\keiba\run_horse_db_daily.bat" /sc daily /st 23:00
+```
 
 ## 🌐 JRA公式サイトからの自動取得(実験的機能)
 
