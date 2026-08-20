@@ -25,7 +25,7 @@ a = Analysis(
     ["keiba_yosou_gui.py"],
     pathex=["."],
     binaries=[],
-    datas=[],
+    datas=[("keiba.ico", ".")],
     hiddenimports=hidden,
     hookspath=[],
     hooksconfig={},
@@ -61,5 +61,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    # icon="keiba.ico",     # アイコンを使う場合はicoを置いてコメント解除
+    icon="keiba.ico",     # exeファイル自体のアイコン
 )

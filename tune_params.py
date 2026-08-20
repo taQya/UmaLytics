@@ -97,7 +97,7 @@ def evaluate(dataset, params):
         rank_sum += rank
         jra = eng.is_jra(rh[0].place)
         payout = eng.TAKEOUT_RETURN_JRA if jra else eng.TAKEOUT_RETURN
-        for pk in eng.ev_bets(ranked, 100.0, payout):
+        for pk in eng.ev_bets(ranked, 100.0, payout, jra):
             ev_invest += 100
             if pk["horse"].umaban == win:
                 ev_ret += pb["単勝払戻"]

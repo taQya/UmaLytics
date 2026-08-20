@@ -36,6 +36,12 @@ import deba_table   # 出馬表ページ(CSVに無い過去5走など)の収集�
 import horse_stats  # horses.sqlite3(馬の生涯レース履歴)由来のスコア補正
 
 
+def resource_path(name: str) -> str:
+    """同梱リソースの実パスを返す(PyInstaller onefile時はMEIPASS配下を見る)"""
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
+    return str(base / name)
+
+
 # ============================================================
 # 予想エンジン(レース前情報のみ使用)
 # ============================================================
@@ -608,9 +614,9 @@ COMBO_PAYOUT = {  # 券種別の払戻率(概算)
 }
 
 
-def _market_prob_map(ranked, payout):
-    """市場の勝率マップ {馬番: p}。実オッズがあれば1/オッズ比例、無ければ人気Zipf"""
-    om = estimate_odds_map(ranked, payout)
+def _market_prob_map(ranked, payout, jra=False):
+    """市場の勝率マップ {馬番: p}。実オッズがあれば1/オッズ比例、無ければ人気から推定"""
+    om = estimate_odds_map(ranked, payout, jra)
     raw = {u: 1.0 / o for u, (o, _real) in om.items()}
     s = sum(raw.values())
     return {u: v / s for u, v in raw.items()}
@@ -647,7 +653,7 @@ def ev_combo_bets(ranked, threshold=100.0, jra=False, top_n=4, per_type=2):
         return []
     payout_win = TAKEOUT_RETURN_JRA if jra else TAKEOUT_RETURN
     pm = dict(zip((h.umaban for h in ranked), model_probs(ranked)))
-    pk = _market_prob_map(ranked, payout_win)
+    pk = _market_prob_map(ranked, payout_win, jra)
     rates = COMBO_PAYOUT[bool(jra)]
     tops = [h.umaban for h in ranked[:top_n]]
 
@@ -759,14 +765,37 @@ def model_probs(ranked):
     return [w / s for w in ws]
 
 
-def estimate_odds_map(ranked, payout=TAKEOUT_RETURN):
+def load_odds_calibration():
+    """calibrate_odds.py が実際の払戻データから作った市場シェア曲線を読み込む
+    (地方競馬のみ対象。中央競馬は的中データが無いため従来のZipf近似のまま)"""
+    import json as _json
+    for base in (app_dir(), Path.cwd()):
+        f = base / "odds_calibration.json"
+        if f.exists():
+            try:
+                data = _json.loads(f.read_text(encoding="utf-8"))
+                return {int(k): v for k, v in data["shares"].items()}
+            except Exception:
+                pass
+    return None
+
+
+ODDS_SHARES = load_odds_calibration()
+
+
+def estimate_odds_map(ranked, payout=TAKEOUT_RETURN, jra=False):
     """単勝オッズマップ {馬番: (オッズ, 実オッズか)}
-    実オッズ列があればそれを優先し、無い馬は人気順位から推定する"""
+    実オッズ列があればそれを優先し、無い馬は人気順位から推定する。
+    地方競馬は ODDS_SHARES(実データ校正済み)があればそれを使い、
+    無ければ/中央競馬は従来のZipf近似(rank^-ZIPF_ALPHA)にフォールバックする"""
     n = len(ranked)
     raw = {}
     for h in ranked:
         rank = h.ninki if h.ninki > 0 else n
-        raw[h.umaban] = rank ** (-ZIPF_ALPHA)
+        if not jra and ODDS_SHARES and rank in ODDS_SHARES:
+            raw[h.umaban] = ODDS_SHARES[rank]
+        else:
+            raw[h.umaban] = rank ** (-ZIPF_ALPHA)
     s = sum(raw.values())
     out = {}
     for h in ranked:
@@ -777,13 +806,13 @@ def estimate_odds_map(ranked, payout=TAKEOUT_RETURN):
     return out
 
 
-def ev_bets(ranked, threshold=100.0, payout=TAKEOUT_RETURN):
+def ev_bets(ranked, threshold=100.0, payout=TAKEOUT_RETURN, jra=False):
     """期待値が閾値(%)以上の単勝買い目リストを返す
     戻り値: [{'horse':Horse,'prob':float,'odds':float,'ev':float}, ...](期待値降順)
     空リスト = 見送り
     """
     probs = model_probs(ranked)
-    odds_map = estimate_odds_map(ranked, payout)
+    odds_map = estimate_odds_map(ranked, payout, jra)
     picks = []
     for h, p in zip(ranked, probs):
         odds, real = odds_map[h.umaban]
@@ -805,7 +834,10 @@ class KeibaApp(tk.Tk):
         self.title("🐴 競馬 予想チャットくん(中央・地方対応)")
         self.geometry("1080x680")
         self.minsize(860, 540)
-
+        try:
+            self.iconbitmap(resource_path("keiba.ico"))  # .ico形式限定(Windows)
+        except tk.TclError:
+            pass  # ico未配置でも起動は継続
         self.horses = []
         self.race_info = {}
         self.paybacks = {}
@@ -1325,7 +1357,7 @@ class KeibaApp(tk.Tk):
                                              for h in ranked}}
             conf_text, conf_rank = confidence_label(ranked)
             payout = TAKEOUT_RETURN_JRA if jra else TAKEOUT_RETURN
-            picks = ev_bets(ranked, ev_threshold, payout)
+            picks = ev_bets(ranked, ev_threshold, payout, jra)
             combo_picks = ev_combo_bets(ranked, ev_threshold, jra)
             ev_s = ("単勝 " + ",".join(str(p["horse"].umaban) for p in picks)) if picks else "見送り"
             pb = self.paybacks.get(key)
