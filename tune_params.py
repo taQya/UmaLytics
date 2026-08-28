@@ -26,6 +26,7 @@ horselist + payback(結果)のペアを使って、予想エンジンの重み
 import argparse
 import json
 import random
+import re
 import sys
 from pathlib import Path
 
@@ -56,6 +57,13 @@ SEARCH_SPACE = {
     "db_jockey":     (0.0, 3.0),
     "db_interval":   (0.0, 5.0),
 }
+
+
+def file_date(path: Path):
+    """ファイル名から日付(YYYYMMDD文字列)を抽出する。
+    '20260707_horselist.csv' 'JRA_2026_0717_horselist.csv' の両方に対応"""
+    m = re.search(r"(20\d{2})_?(\d{2})_?(\d{2})", path.stem)
+    return f"{m.group(1)}{m.group(2)}{m.group(3)}" if m else path.stem
 
 
 def load_day(horselist_path: Path):
@@ -184,6 +192,58 @@ def tune(files, iters=300, objective="hits", seed=42, progress=print):
     return best_p, base, best_r, n_races, base_off
 
 
+def tune_with_holdout(files, iters=300, objective="hits", holdout_frac=0.25,
+                       seed=42, progress=print):
+    """日付でtrain/holdoutに分割し、trainだけでチューニングしてholdout
+    (学習に一切使っていない=未来を模した期間)で成績を検証する。
+    tune_params.py単体の「学習データ上の成績」だけでは過学習に気づけない
+    ため、実運用に近い形で「本当に改善しているか」を確認するための機能。
+    戻り値の最後(hold_after)がNoneの場合は分割できなかったことを示す。"""
+    paths = sorted((Path(f) for f in files), key=lambda p: (file_date(p), p.name))
+    if len(paths) < 8:
+        progress(f"⚠ ファイル数({len(paths)})が少なくholdout分割の信頼性が低いため、"
+                 "分割せず全データで学習します。")
+        best_p, base, best_r, n_races, base_off = tune(files, iters, objective, seed, progress)
+        return best_p, base, best_r, n_races, base_off, None
+
+    n_holdout = max(1, round(len(paths) * holdout_frac))
+    train_paths, holdout_paths = paths[:-n_holdout], paths[-n_holdout:]
+    progress(f"📅 学習期間: {file_date(train_paths[0])}〜{file_date(train_paths[-1])}"
+             f"({len(train_paths)}日) / 検証期間(未来役・学習に未使用): "
+             f"{file_date(holdout_paths[0])}〜{file_date(holdout_paths[-1])}"
+             f"({len(holdout_paths)}日)\n")
+
+    defaults_before = dict(eng.PARAMS)
+    best_p, base, best_r, n_races, base_off = tune(
+        [str(p) for p in train_paths], iters, objective, seed, progress)
+
+    hold_dataset = []
+    for p in holdout_paths:
+        d = load_day(p)
+        if d:
+            hold_dataset.extend(d)
+    if not hold_dataset:
+        progress("⚠ 検証期間にpayback付きデータがありませんでした")
+        return best_p, base, best_r, n_races, base_off, None
+
+    hold_before = evaluate(hold_dataset, defaults_before)
+    hold_after = evaluate(hold_dataset, best_p)
+    progress(f"\n🔍 検証期間({len(holdout_paths)}日・学習に未使用)での成績"
+             "(これが実運用に一番近い数字):")
+    progress(f"   調整前パラメータ: ◎的中 {hold_before[0]}/{hold_before[3]} "
+             f"/ 平均予想順位 {hold_before[1]:.2f}位 / EV回収率 {hold_before[2]:.0f}%")
+    progress(f"   調整後パラメータ: ◎的中 {hold_after[0]}/{hold_after[3]} "
+             f"/ 平均予想順位 {hold_after[1]:.2f}位 / EV回収率 {hold_after[2]:.0f}%")
+    if score_key(hold_after, objective) <= score_key(hold_before, objective):
+        progress("⚠ 検証期間では改善していません。学習データへの過学習の可能性が高いので、"
+                 "この調整結果の採用は見送るか、iters/データ量を見直してください。")
+    else:
+        progress("✅ 学習に使っていない期間でも改善しています(過学習ではなさそう)。")
+
+    eng.PARAMS.update(defaults_before)
+    return best_p, base, best_r, n_races, base_off, hold_after
+
+
 def save_params(params, meta, path=None):
     path = Path(path) if path else eng.app_dir() / "keiba_params.json"
     data = {k: round(v, 3) for k, v in params.items()}
@@ -200,8 +260,18 @@ def main():
     ap.add_argument("--objective", choices=["hits", "recovery"], default="hits",
                     help="hits=◎的中数 / recovery=期待値買いの回収率")
     ap.add_argument("--out", type=Path, default=None, help="保存先(デフォルト: keiba_params.json)")
+    ap.add_argument("--holdout", type=float, default=0.25,
+                    help="検証用に末尾何割の日付を学習から除外するか(デフォルト0.25。"
+                         "0にすると検証なしで全データ学習=従来動作)")
     args = ap.parse_args()
     try:
+        if args.holdout > 0:
+            _, _, _, _, _, hold_after = tune_with_holdout(
+                args.horselists, args.iters, args.objective, args.holdout)
+            if hold_after is not None:
+                print("\n" + "=" * 60)
+                print("📦 検証が終わったので、最終的な保存用パラメータは全データ"
+                      "(学習期間+検証期間)で学習し直します。")
         best_p, base, best_r, n, base_off = tune(
             args.horselists, args.iters, args.objective)
     except RuntimeError as e:
