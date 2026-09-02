@@ -855,18 +855,18 @@ class KeibaApp(tk.Tk):
         top = ttk.Frame(self, padding=(10, 8))
         top.pack(fill="x")
         ttk.Button(top, text="📂 出馬表CSVを開く", command=self.open_csv).pack(side="left")
-        self.jra_btn = ttk.Button(top, text="🌐 JRAから取得", command=self.fetch_from_jra)
-        self.jra_btn.pack(side="left", padx=(6, 0))
-        self.result_btn = ttk.Button(top, text="🏁 JRA結果取得", command=self.fetch_results_jra)
-        self.result_btn.pack(side="left", padx=(6, 0))
+#        self.jra_btn = ttk.Button(top, text="🌐 JRAから取得", command=self.fetch_from_jra)
+#        self.jra_btn.pack(side="left", padx=(6, 0))
+#        self.result_btn = ttk.Button(top, text="🏁 JRA結果取得", command=self.fetch_results_jra)
+#        self.result_btn.pack(side="left", padx=(6, 0))
         self.nar_btn = ttk.Button(top, text="🏇 地方競馬データ取得", command=self.fetch_from_nar)
         self.nar_btn.pack(side="left", padx=(6, 0))
         self.deba_btn = ttk.Button(top, text="📋 出馬表データ取得", command=self.fetch_deba,
                                    state="disabled")
         self.deba_btn.pack(side="left", padx=(6, 0))
-        self.tune_btn = ttk.Button(top, text="📈 結果から学習", command=self.tune_from_results,
-                                   state="disabled")
-        self.tune_btn.pack(side="left", padx=(6, 0))
+#        self.tune_btn = ttk.Button(top, text="📈 結果から学習", command=self.tune_from_results,
+#                                   state="disabled")
+#        self.tune_btn.pack(side="left", padx=(6, 0))
         self.spat4_btn = ttk.Button(top, text="🎫 SPAT4投票リスト", command=self.make_spat4_list,
                                     state="disabled")
         self.spat4_btn.pack(side="left", padx=(6, 0))
