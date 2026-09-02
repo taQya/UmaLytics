@@ -2,3 +2,6 @@ horselist/
 __pycache__/
 build/
 dist/
+horses.sqlite3
+horses.sqlite3-*
+spat4_debug/

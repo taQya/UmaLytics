@@ -32,6 +32,15 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 
+import deba_table   # 出馬表ページ(CSVに無い過去5走など)の収集とスコア補正
+import horse_stats  # horses.sqlite3(馬の生涯レース履歴)由来のスコア補正
+
+
+def resource_path(name: str) -> str:
+    """同梱リソースの実パスを返す(PyInstaller onefile時はMEIPASS配下を見る)"""
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
+    return str(base / name)
+
 
 # ============================================================
 # 予想エンジン(レース前情報のみ使用)
@@ -134,6 +143,9 @@ class Horse:
     last3: list = field(default_factory=list)  # 直近3走の着順(新しい順)
     jockey_affili: str = ""        # 騎手所属(JRA/大井など)
     trainer_affili: str = ""       # 調教師所属
+    race_date: str = ""            # 競走年月日 YYYYMMDD
+    deba: dict = field(default_factory=dict)  # 出馬表ページ由来の情報(過去5走など)
+    db: dict = field(default_factory=dict)    # horses.sqlite3由来の生涯レース履歴(初回のみ取得)
     score: float = 0.0
     reasons: list = field(default_factory=list)
     scratched: bool = False
@@ -190,6 +202,7 @@ def load_horselist(path: Path):
                    for k in ("前走着順", "2走前着順", "3走前着順")],
             jockey_affili=str(g(r, "騎手所属", default="") or "").strip(),
             trainer_affili=str(g(r, "調教師所属", "厩舎所属", default="") or "").strip(),
+            race_date=str(g(r, "競走年月日", default="") or "").strip(),
             scratched=(ninki <= 0),
         ))
         st = str(g(r, "状態", default="") or "")
@@ -200,6 +213,7 @@ def load_horselist(path: Path):
             h.scratched = False
     if not horses:
         raise ValueError("horselistから有効な出走データを読み込めませんでした")
+    deba_table.attach(horses, path)   # 出馬表ページ由来の情報(キャッシュがあれば)
     return horses
 
 
@@ -349,6 +363,10 @@ PARAMS = {
     "softmax_t": 10.0,   # スコア→勝率の温度
     "jra_affili": 8.0,   # JRA所属馬への加点(交流重賞での実力差を考慮)
 }
+# 出馬表ページ由来の重み(deba_recent/margin/agari/pace/interval/jockey)
+PARAMS.update(deba_table.PARAMS_DEFAULT)
+# horses.sqlite3(生涯レース履歴)由来の重み(db_recent/dist/jockey/interval)
+PARAMS.update(horse_stats.PARAMS_DEFAULT)
 
 
 def app_dir():
@@ -596,9 +614,9 @@ COMBO_PAYOUT = {  # 券種別の払戻率(概算)
 }
 
 
-def _market_prob_map(ranked, payout):
-    """市場の勝率マップ {馬番: p}。実オッズがあれば1/オッズ比例、無ければ人気Zipf"""
-    om = estimate_odds_map(ranked, payout)
+def _market_prob_map(ranked, payout, jra=False):
+    """市場の勝率マップ {馬番: p}。実オッズがあれば1/オッズ比例、無ければ人気から推定"""
+    om = estimate_odds_map(ranked, payout, jra)
     raw = {u: 1.0 / o for u, (o, _real) in om.items()}
     s = sum(raw.values())
     return {u: v / s for u, v in raw.items()}
@@ -635,7 +653,7 @@ def ev_combo_bets(ranked, threshold=100.0, jra=False, top_n=4, per_type=2):
         return []
     payout_win = TAKEOUT_RETURN_JRA if jra else TAKEOUT_RETURN
     pm = dict(zip((h.umaban for h in ranked), model_probs(ranked)))
-    pk = _market_prob_map(ranked, payout_win)
+    pk = _market_prob_map(ranked, payout_win, jra)
     rates = COMBO_PAYOUT[bool(jra)]
     tops = [h.umaban for h in ranked[:top_n]]
 
@@ -716,6 +734,8 @@ def predict_race(horses, info=None):
     for h in horses:
         score_horse(h, info)
     adjust_kinryo(horses)
+    deba_table.adjust(horses, PARAMS)   # 近走・脚質はレース内相対で効かせる
+    horse_stats.adjust(horses, info, PARAMS)  # 生涯レース履歴由来の補正
     return sorted(horses, key=lambda x: x.score, reverse=True)
 
 
@@ -745,14 +765,37 @@ def model_probs(ranked):
     return [w / s for w in ws]
 
 
-def estimate_odds_map(ranked, payout=TAKEOUT_RETURN):
+def load_odds_calibration():
+    """calibrate_odds.py が実際の払戻データから作った市場シェア曲線を読み込む
+    (地方競馬のみ対象。中央競馬は的中データが無いため従来のZipf近似のまま)"""
+    import json as _json
+    for base in (app_dir(), Path.cwd()):
+        f = base / "odds_calibration.json"
+        if f.exists():
+            try:
+                data = _json.loads(f.read_text(encoding="utf-8"))
+                return {int(k): v for k, v in data["shares"].items()}
+            except Exception:
+                pass
+    return None
+
+
+ODDS_SHARES = load_odds_calibration()
+
+
+def estimate_odds_map(ranked, payout=TAKEOUT_RETURN, jra=False):
     """単勝オッズマップ {馬番: (オッズ, 実オッズか)}
-    実オッズ列があればそれを優先し、無い馬は人気順位から推定する"""
+    実オッズ列があればそれを優先し、無い馬は人気順位から推定する。
+    地方競馬は ODDS_SHARES(実データ校正済み)があればそれを使い、
+    無ければ/中央競馬は従来のZipf近似(rank^-ZIPF_ALPHA)にフォールバックする"""
     n = len(ranked)
     raw = {}
     for h in ranked:
         rank = h.ninki if h.ninki > 0 else n
-        raw[h.umaban] = rank ** (-ZIPF_ALPHA)
+        if not jra and ODDS_SHARES and rank in ODDS_SHARES:
+            raw[h.umaban] = ODDS_SHARES[rank]
+        else:
+            raw[h.umaban] = rank ** (-ZIPF_ALPHA)
     s = sum(raw.values())
     out = {}
     for h in ranked:
@@ -763,13 +806,13 @@ def estimate_odds_map(ranked, payout=TAKEOUT_RETURN):
     return out
 
 
-def ev_bets(ranked, threshold=100.0, payout=TAKEOUT_RETURN):
+def ev_bets(ranked, threshold=100.0, payout=TAKEOUT_RETURN, jra=False):
     """期待値が閾値(%)以上の単勝買い目リストを返す
     戻り値: [{'horse':Horse,'prob':float,'odds':float,'ev':float}, ...](期待値降順)
     空リスト = 見送り
     """
     probs = model_probs(ranked)
-    odds_map = estimate_odds_map(ranked, payout)
+    odds_map = estimate_odds_map(ranked, payout, jra)
     picks = []
     for h, p in zip(ranked, probs):
         odds, real = odds_map[h.umaban]
@@ -791,7 +834,10 @@ class KeibaApp(tk.Tk):
         self.title("🐴 競馬 予想チャットくん(中央・地方対応)")
         self.geometry("1080x680")
         self.minsize(860, 540)
-
+        try:
+            self.iconbitmap(resource_path("keiba.ico"))  # .ico形式限定(Windows)
+        except tk.TclError:
+            pass  # ico未配置でも起動は継続
         self.horses = []
         self.race_info = {}
         self.paybacks = {}
@@ -809,15 +855,18 @@ class KeibaApp(tk.Tk):
         top = ttk.Frame(self, padding=(10, 8))
         top.pack(fill="x")
         ttk.Button(top, text="📂 出馬表CSVを開く", command=self.open_csv).pack(side="left")
-        self.jra_btn = ttk.Button(top, text="🌐 JRAから取得", command=self.fetch_from_jra)
-        self.jra_btn.pack(side="left", padx=(6, 0))
-        self.result_btn = ttk.Button(top, text="🏁 JRA結果取得", command=self.fetch_results_jra)
-        self.result_btn.pack(side="left", padx=(6, 0))
+#        self.jra_btn = ttk.Button(top, text="🌐 JRAから取得", command=self.fetch_from_jra)
+#        self.jra_btn.pack(side="left", padx=(6, 0))
+#        self.result_btn = ttk.Button(top, text="🏁 JRA結果取得", command=self.fetch_results_jra)
+#        self.result_btn.pack(side="left", padx=(6, 0))
         self.nar_btn = ttk.Button(top, text="🏇 地方競馬データ取得", command=self.fetch_from_nar)
         self.nar_btn.pack(side="left", padx=(6, 0))
-        self.tune_btn = ttk.Button(top, text="📈 結果から学習", command=self.tune_from_results,
+        self.deba_btn = ttk.Button(top, text="📋 出馬表データ取得", command=self.fetch_deba,
                                    state="disabled")
-        self.tune_btn.pack(side="left", padx=(6, 0))
+        self.deba_btn.pack(side="left", padx=(6, 0))
+#        self.tune_btn = ttk.Button(top, text="📈 結果から学習", command=self.tune_from_results,
+#                                   state="disabled")
+#        self.tune_btn.pack(side="left", padx=(6, 0))
         self.spat4_btn = ttk.Button(top, text="🎫 SPAT4投票リスト", command=self.make_spat4_list,
                                     state="disabled")
         self.spat4_btn.pack(side="left", padx=(6, 0))
@@ -920,12 +969,14 @@ class KeibaApp(tk.Tk):
         self.paybacks = load_payback(pb) if pb else {}
 
         n_races = len({(h.place, h.race_no) for h in self.horses if not h.scratched})
+        n_deba = sum(1 for h in self.horses if h.deba)
         extras = []
         if rl:
             extras.append(f"レース情報: {rl.name}")
         if pb:
             extras.append(f"払戻: {pb.name}")
-        extra_s = " / ".join(extras) if extras else "racelist・payback未検出(予想のみ)"
+        extras.append(f"出馬表: {n_deba}頭" if n_deba else "出馬表データ未取得")
+        extra_s = " / ".join(extras)
         self.file_label.config(
             text=f"{path.name}({len(self.horses)}頭・{n_races}レース) | {extra_s}",
             foreground="#000")
@@ -939,6 +990,9 @@ class KeibaApp(tk.Tk):
         self.run_btn.config(state="normal")
         self.tune_btn.config(state="normal" if self.paybacks else "disabled")
         self.spat4_btn.config(state="normal")
+        nar_races = {(h.place, h.race_no) for h in self.horses
+                     if h.place in deba_table.BABA_CODES}
+        self.deba_btn.config(state="normal" if nar_races else "disabled")
         jra_p = [pl for pl in places if is_jra(pl)]
         nar_p = [pl for pl in places if not is_jra(pl)]
         parts = []
@@ -1063,6 +1117,58 @@ class KeibaApp(tk.Tk):
         self._log(f"\n❌ 取得失敗: {msg}\n")
         messagebox.showerror("取得失敗", msg)
 
+    # ---------- 出馬表データ取得(CSVに無い過去5走など) ----------
+    def fetch_deba(self):
+        races = sorted({(h.place, h.race_no) for h in self.horses
+                        if h.place in deba_table.BABA_CODES})
+        if not races:
+            messagebox.showinfo("対象なし", "地方競馬のレースがありません(中央は非対応です)。")
+            return
+        secs = int(len(races) * deba_table.SLEEP)
+        if not messagebox.askokcancel(
+                "出馬表データ取得",
+                f"出馬表ページから、CSVに無い馬情報を取得します({len(races)}レース)。\n"
+                "取得するのは過去5走の着順・タイム・上がり3F・コーナー通過順・\n"
+                "着差・騎手・斤量・馬体重などで、近走評価や脚質の判定に使います。\n\n"
+                f"・サーバー負荷防止のため1レースごとに{deba_table.SLEEP}秒待機します"
+                f"(約{secs // 60}分{secs % 60}秒)\n"
+                "・取得済みのレースは再取得しません\n"
+                "・個人利用の範囲で、サイトの利用条件をご確認ください\n\n取得を開始しますか?"):
+            return
+        self.deba_btn.config(state="disabled")
+        self._log_clear()
+        self._log("📋 出馬表データを取得します...\n")
+
+        import threading
+        hl = self.horselist_path
+
+        def worker():
+            try:
+                _, total = deba_table.fetch_day(
+                    hl, races,
+                    progress=lambda m: self.after(0, self._log, str(m) + "\n"))
+                self.after(0, self._deba_done, hl, total)
+            except Exception as e:
+                self.after(0, self._deba_failed, str(e))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _deba_done(self, hl, total):
+        self.deba_btn.config(state="normal")
+        self._log(f"\n✅ 出馬表データ{total}レース分を保存しました。\n")
+        # 新しい情報を反映させるため、確定済みスコアは破棄して予想し直す
+        snap = snapshot_file(hl)
+        if snap.exists():
+            snap.unlink()
+            self._log("🔓 収集した情報を反映するため、確定済み予想を解除しました。\n")
+        self.load_horselist_file(hl)
+        self.run_prediction()
+
+    def _deba_failed(self, msg):
+        self.deba_btn.config(state="normal")
+        self._log(f"\n❌ 出馬表データの取得に失敗: {msg}\n")
+        messagebox.showerror("取得失敗", msg)
+
     # ---------- JRA結果取得 ----------
     def fetch_results_jra(self):
         try:
@@ -1142,10 +1248,11 @@ class KeibaApp(tk.Tk):
 
         def worker():
             try:
-                best_p, base, best_r, n = tune_params.tune(
+                best_p, base, best_r, n, base_off = tune_params.tune(
                     [str(hl)], iters=400,
                     progress=lambda m: self.after(0, self._log, str(m) + "\n"))
                 meta = {"学習レース数": n, "調整前_的中": base[0], "調整後_的中": best_r[0],
+                        "出馬表なし_的中": base_off[0],
                         "注意": "学習データ上の成績。未来の的中を保証しません"}
                 path = tune_params.save_params(best_p, meta)
                 self.after(0, self._tune_done, path)
@@ -1250,7 +1357,7 @@ class KeibaApp(tk.Tk):
                                              for h in ranked}}
             conf_text, conf_rank = confidence_label(ranked)
             payout = TAKEOUT_RETURN_JRA if jra else TAKEOUT_RETURN
-            picks = ev_bets(ranked, ev_threshold, payout)
+            picks = ev_bets(ranked, ev_threshold, payout, jra)
             combo_picks = ev_combo_bets(ranked, ev_threshold, jra)
             ev_s = ("単勝 " + ",".join(str(p["horse"].umaban) for p in picks)) if picks else "見送り"
             pb = self.paybacks.get(key)
@@ -1322,7 +1429,6 @@ class KeibaApp(tk.Tk):
             self.status.config(text=f"{frozen_label}予想完了: {n}レース。一覧をクリックすると詳細を表示します | 参考予想です🐴")
 
         self.save_txt_btn.config(state="normal")
-        self.save_json_btn.config(state="normal")
 
         first = self.tree.get_children()
         if first:
@@ -1413,6 +1519,29 @@ class KeibaApp(tk.Tk):
             elif chaku_map:
                 t.insert("end", "  → 圏外", "miss")
             t.insert("end", "\n", "chat")
+
+        # --- 出馬表ページから集めた近走(CSVには無い情報) ---
+        if any(h.deba.get("過去走") for h in ranked[:3]):
+            t.insert("end", "\n🗒 印上位の近走(出馬表より):\n", "chat")
+            for i, h in enumerate(ranked[:3]):
+                past = h.deba.get("過去走") or []
+                if not past:
+                    continue
+                t.insert("end", f" {MARKS[i]} {h.umaban}番 {h.name}\n", "chat")
+                for r in past[:3]:
+                    chaku = f"{r['着順']}着" if r["着順"] else (r["状態"] or "－")
+                    bits = [f"{r['日付'][5:].replace('-', '/')}",
+                            f"{r['競馬場']}{r['芝ダート']}{r['距離']}m",
+                            f"{r['馬場']}", f"{r['頭数']}頭", chaku]
+                    if r.get("着差") is not None:
+                        bits.append(f"{'先着' if r['着順'] == 1 else '差'}{r['着差']}秒")
+                    if r.get("上がり3F"):
+                        bits.append(f"上り{r['上がり3F']}")
+                    if r.get("通過順"):
+                        bits.append("通過" + "-".join(str(x) for x in r["通過順"]))
+                    if r.get("騎手"):
+                        bits.append(r["騎手"])
+                    t.insert("end", "    " + " ".join(bits) + "\n", "meta")
 
         if len(ranked) >= 3:
             a, b, c = ranked[0].umaban, ranked[1].umaban, ranked[2].umaban
