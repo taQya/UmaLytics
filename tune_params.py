@@ -50,12 +50,15 @@ SEARCH_SPACE = {
     "deba_pace":     (0.0, 8.0),
     "deba_interval": (0.0, 5.0),
     "deba_jockey":   (0.0, 6.0),
+    # 前走と今回のクラス差による近走点補正の強度(0=無効〜1=設計値どおり)
+    "deba_class_adj": (0.0, 1.5),
     # horses.sqlite3(生涯レース履歴)由来。DBが無い/紐付かない馬は効かないので
     # その場合は0付近に落ちる
     "db_recent":     (0.0, 20.0),
     "db_dist":       (0.0, 3.0),
     "db_jockey":     (0.0, 3.0),
     "db_interval":   (0.0, 5.0),
+    "db_class_adj":  (0.0, 1.5),
 }
 
 

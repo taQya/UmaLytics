@@ -33,6 +33,8 @@ except ImportError:
     requests = None
     import urllib.request
 
+import race_grade
+
 BASE = "https://www.keiba.go.jp/KeibaWeb/TodayRaceInfo/DebaTable"
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 SLEEP = 10.0         # リクエスト間隔(秒)。keiba.go.jp の robots.txt が Crawl-delay: 10 を
@@ -306,6 +308,10 @@ PARAMS_DEFAULT = {
     "deba_pace": 0.3,      # 脚質・先行力(コーナー通過順のレース内相対)
     "deba_interval": 0.2,  # レース間隔(休み明け/連闘)
     "deba_jockey": 0.2,    # 継続騎乗
+    # 前走と今回のクラス差による近走点の補正強度(0で無効=従来通り、
+    # 1で race_grade.class_adjust() の設計値どおり)。他のdeba系と同じ理由
+    # (過学習リスク)で、まずは控えめな値から始める。
+    "deba_class_adj": 0.5,
 }
 
 # 着順 → 点。前走ほど重い重みを掛けて平均する。
@@ -321,18 +327,30 @@ def _rank_pts(chaku):
     return -1.0 if chaku <= 9 else -2.5
 
 
-def _features(h):
-    """1頭ぶんの特徴量。出馬表データが無ければ None"""
+def _features(h, cur_level=None, class_adj_strength=0.0):
+    """1頭ぶんの特徴量。出馬表データが無ければ None
+    cur_level: 今回のレースの格(race_grade.grade_level)。分かれば、前走
+    以前との格差で近走点を補正する(重賞での善戦評価・昇格挑戦の割引等)。"""
     d = getattr(h, "deba", None)
     past = (d or {}).get("過去走") or []
     if not past:
         return None
 
     pts = wsum = 0.0
+    class_note = None
     for run, w in zip(past, _RUN_WEIGHTS):
-        p = _rank_pts(run.get("着順"))
+        chaku = run.get("着順")
+        p = _rank_pts(chaku)
         if p is None:      # 中止・除外は評価から外す
             continue
+        if cur_level is not None:
+            past_level = race_grade.grade_level(run.get("レース名"))
+            margin = None if chaku == 1 else run.get("着差")
+            adj = race_grade.class_adjust(p, chaku, margin, past_level,
+                                          cur_level, class_adj_strength)
+            if run is past[0] and adj != p:
+                class_note = (adj > p, past_level, cur_level)
+            p = adj
         pts += p * w
         wsum += w
     recent = (pts / wsum / 4.0) if wsum else 0.0
@@ -368,6 +386,7 @@ def _features(h):
         "jockey_cont": bool(last_jockey and h.jockey and last_jockey == h.jockey),
         "last_chaku": past[0].get("着順"),
         "good3": sum(1 for r in past[:3] if (r.get("着順") or 99) <= 3),
+        "class_note": class_note,
     }
 
 
@@ -400,10 +419,18 @@ def _zmap(feats, key):
             for u, f in feats.items() if f.get(key) is not None}
 
 
-def adjust(horses, params):
+def adjust(horses, params, info=None):
     """出馬表由来の特徴量でスコアを補正する(レース単位で呼ぶ)。
-    レース内で相対評価する指標があるため score_horse ではなくここで行う。"""
-    feats = {h.umaban: f for h in horses if (f := _features(h))}
+    レース内で相対評価する指標があるため score_horse ではなくここで行う。
+    info(今回のレース情報)があれば、前走以前とのクラス差で近走点を補正する。"""
+    cur_level = None
+    strength = params.get("deba_class_adj", 0.0)
+    if info and strength > 0:
+        cur_level = race_grade.grade_level(
+            info.get("レース名"),
+            "重賞" if info.get("競走種類") == "重賞" else "")
+    feats = {h.umaban: f for h in horses
+             if (f := _features(h, cur_level, strength))}
     if not feats:
         return
     z_margin = _zmap(feats, "margin")
@@ -434,6 +461,16 @@ def _reasons(h, f, zm, za, zp, params):
             out.append("前走を勝っての臨戦")
         elif f["good3"] >= 2:
             out.append(f"近3走で{f['good3']}回の3着以内")
+    note = f.get("class_note")
+    if params.get("deba_class_adj") and note:
+        improved, past_level, cur_level = note
+        if improved:
+            out.append("前走は格上相手の善戦(僅差 or 格上げ評価)")
+        elif (past_level is not None and cur_level is not None
+              and cur_level - past_level >= 2):
+            # 1クラスだけの通常昇級はよくあるので割愛し、2段階以上の
+            # 格上挑戦(重賞・オープン初挑戦など)のときだけ注記する
+            out.append("前走は格下相手の好走、大幅な格上挑戦のため評価を割引")
     if params.get("deba_margin") and zm is not None and zm >= 0.8:
         out.append("近走の着差が小さく力量差はわずか")
     if params.get("deba_agari") and za is not None and za >= 0.8:

@@ -27,6 +27,8 @@ import sqlite3
 from datetime import date
 from pathlib import Path
 
+import race_grade
+
 
 def _default_db_path():
     import sys as _sys
@@ -94,7 +96,7 @@ def _to_iso(ymd):
 
 
 _HIST_COLS = ("race_date", "track", "distance", "chaku", "time_sec",
-              "agari3f", "jockey")
+              "agari3f", "jockey", "grade", "race_name", "margin")
 
 
 def _fetch_history(con, codes, before_iso):
@@ -165,15 +167,25 @@ def _days_between(later_iso, earlier_iso):
     return (date(y1, m1, d1) - date(y2, m2, d2)).days
 
 
-def _recent_score(races, before_iso, half_life=45, max_n=10):
+def _recent_score(races, before_iso, half_life=45, max_n=10,
+                   cur_level=None, class_adj_strength=0.0):
     """日数ベースで指数重み付けした近走点(target: 概ね-0.6〜2.0)。
     half_life日で過去レースの重みが半分になる(deba_recentより長いレンジ・
-    多いレース数で「今の調子」を捉える)。"""
+    多いレース数で「今の調子」を捉える)。
+    cur_level: 今回のレースの格(race_grade.grade_level)。分かれば、その
+    レースとの格差で各過去走の評価点を補正する(重賞での善戦評価・昇格
+    挑戦の割引等。race_grade.class_adjust 参照)。"""
     pts = wsum = 0.0
     for r in races[:max_n]:
-        p = _rank_pts(r["chaku"])
+        chaku = r["chaku"]
+        p = _rank_pts(chaku)
         if p is None or not r["race_date"]:
             continue
+        if cur_level is not None:
+            past_level = race_grade.grade_level(r.get("grade"), r.get("race_name"))
+            margin = None if chaku == 1 else r.get("margin")
+            p = race_grade.class_adjust(p, chaku, margin, past_level,
+                                        cur_level, class_adj_strength)
         days = max(0, _days_between(before_iso, r["race_date"]))
         w = 0.5 ** (days / half_life)
         pts += p * w
@@ -244,13 +256,20 @@ PARAMS_DEFAULT = {
     "db_dist":     0.3,   # 全競馬場通算の当距離適性
     "db_jockey":   0.2,   # この馬×今回騎手のコンビ成績
     "db_interval": 0.2,   # 前走(DB上の最新レース)からの間隔
+    # 過去走と今回のクラス差による近走点の補正強度(0で無効=従来通り、
+    # 1で race_grade.class_adjust() の設計値どおり)。db_recent自体では
+    # なく「recent」を計算するたびに掛かるので、下のfeatキャッシュには
+    # 含めない(パラメータ探索で値を変えるたびに反映させるため)。
+    "db_class_adj": 0.5,
 }
 
 
 def _ensure_features(h, target_dist):
     """h.db["races"](生涯レース履歴)から特徴量を計算し h.db["feat"] にキャッシュする。
-    特徴量自体はパラメータに依存しないので、パラメータ探索(tune_params.py)で
-    同じ馬を何度スコアリングし直しても履歴の再走査は初回の1回だけで済む。"""
+    「recent」(近走点)はクラス差補正がレース(=呼び出しごと)のパラメータに
+    依存するためここではキャッシュしない。それ以外の特徴量はパラメータに
+    依存しないので、パラメータ探索(tune_params.py)で同じ馬を何度スコアリング
+    し直しても履歴の再走査は初回の1回だけで済む。"""
     d = h.db
     if "feat" in d:
         return d["feat"]
@@ -259,7 +278,6 @@ def _ensure_features(h, target_dist):
     feat = {}
     if races and before:
         feat = {
-            "recent": _recent_score(races, before),
             "dist": _distance_aptitude(races, target_dist),
             "combo": _jockey_combo(races, getattr(h, "jockey", "")),
             "interval": (_days_between(before, races[0]["race_date"])
@@ -274,15 +292,26 @@ def adjust(horses, info, params):
     DBが無い/紐付かない馬はスコアを変えない(既存の予想を壊さない)。"""
     ensure_history(horses)
     target_dist = (info or {}).get("距離") or 0
+    class_adj_strength = params.get("db_class_adj", 0.0)
+    cur_level = None
+    if info and class_adj_strength > 0:
+        cur_level = race_grade.grade_level(
+            info.get("レース名"),
+            "重賞" if info.get("競走種類") == "重賞" else "")
     for h in horses:
         if not getattr(h, "db", None):
             continue
         feat = _ensure_features(h, target_dist)
-        if not feat:
+        races = h.db.get("races") or []
+        before = _to_iso(getattr(h, "race_date", "") or "")
+        recent = (_recent_score(races, before, cur_level=cur_level,
+                                class_adj_strength=class_adj_strength)
+                  if races and before else None)
+        if not feat and recent is None:
             continue
 
-        if feat.get("recent") is not None:
-            h.score += params.get("db_recent", 0.0) * feat["recent"]
+        if recent is not None:
+            h.score += params.get("db_recent", 0.0) * recent
 
         dist = feat.get("dist")
         if dist:

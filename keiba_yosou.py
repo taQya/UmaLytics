@@ -236,6 +236,9 @@ def load_racelist(path: Path):
             "回り": str(g(r, "回り", default="") or "").strip(),
             "頭数": to_int(g(r, "頭数")),
             "天候": str(g(r, "天候", default="") or "").strip(),
+            # 普通/特別/重賞。過去走とのクラス差補正(race_grade)で
+            # 「重賞かどうか」をレース名の表記に頼らず判定するために使う。
+            "競走種類": str(g(r, "競走種類名称", default="") or "").strip(),
         }
     return info
 
@@ -623,7 +626,7 @@ def predict_race(horses, info=None):
     for h in horses:
         score_horse(h, info)
     adjust_kinryo(horses)
-    deba_table.adjust(horses, PARAMS)   # 近走・脚質はレース内相対で効かせる
+    deba_table.adjust(horses, PARAMS, info)   # 近走・脚質はレース内相対で効かせる
     horse_stats.adjust(horses, info, PARAMS)  # 生涯レース履歴由来の補正
     return sorted(horses, key=lambda x: x.score, reverse=True)
 
