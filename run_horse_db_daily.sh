@@ -5,6 +5,9 @@
 # cron登録例(毎日20:00に実行):
 #   crontab -e
 #   0 20 * * * /path/to/UmaLytics/run_horse_db_daily.sh >> /path/to/UmaLytics/horse_db_daily.log 2>&1
+git fetch origin master
 cd "$(dirname "$0")"
 PYTHON=${PYTHON:-python3}
 "$PYTHON" horse_db.py --daily
+git commit -m "horse_db: daily update" horses.sqlite3 || true
+git push origin master || true
